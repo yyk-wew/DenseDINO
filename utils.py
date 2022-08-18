@@ -32,6 +32,9 @@ from torch import nn
 import torch.distributed as dist
 from PIL import ImageFilter, ImageOps
 
+import argparse
+import warnings
+from torch import Tensor
 
 class GaussianBlur(object):
     """
@@ -484,6 +487,13 @@ def init_distributed_mode(args):
     else:
         print('Does not support training without GPU.')
         sys.exit(1)
+
+    # print("__________")
+    # print(os.environ['MASTER_ADDR'])
+    # print(os.environ['MASTER_PORT'])
+    # print(os.environ['LOCAL_RANK'])
+    # print(os.environ["RANK"])
+    # print("__________")
 
     dist.init_process_group(
         backend="nccl",
