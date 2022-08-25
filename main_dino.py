@@ -136,6 +136,9 @@ def train_dino(args):
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
+    if utils.is_main_process():
+        with open(os.path.join(args.output_dir, 'argument.txt'), 'w') as f:
+            json.dump(args.__dict__, f, indent=2)
 
     # ============ preparing data ... ============
     transform = DataAugmentationDINO(
