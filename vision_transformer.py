@@ -135,16 +135,17 @@ class VisionTransformer(nn.Module):
     """ Vision Transformer """
     def __init__(self, img_size=[224], patch_size=16, in_chans=3, num_classes=0, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., norm_layer=nn.LayerNorm, **kwargs):
+                 drop_path_rate=0., norm_layer=nn.LayerNorm, num_cls_token=1, **kwargs):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
+        self.num_cls_token = num_cls_token
 
         self.patch_embed = PatchEmbed(
             img_size=img_size[0], patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
 
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        self.cls_token = nn.Parameter(torch.zeros(1, num_cls_token, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + num_cls_token, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
@@ -172,12 +173,12 @@ class VisionTransformer(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def interpolate_pos_encoding(self, x, w, h):
-        npatch = x.shape[1] - 1
-        N = self.pos_embed.shape[1] - 1
+        npatch = x.shape[1] - self.num_cls_token
+        N = self.pos_embed.shape[1] - self.num_cls_token
         if npatch == N and w == h:
             return self.pos_embed
-        class_pos_embed = self.pos_embed[:, 0]
-        patch_pos_embed = self.pos_embed[:, 1:]
+        class_pos_embed = self.pos_embed[:, :self.num_cls_token]
+        patch_pos_embed = self.pos_embed[:, self.num_cls_token:]
         dim = x.shape[-1]
         w0 = w // self.patch_embed.patch_size
         h0 = h // self.patch_embed.patch_size
@@ -191,7 +192,8 @@ class VisionTransformer(nn.Module):
         )
         assert int(w0) == patch_pos_embed.shape[-2] and int(h0) == patch_pos_embed.shape[-1]
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
-        return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1)
+        # return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1)
+        return torch.cat((class_pos_embed, patch_pos_embed), dim=1)
 
     def prepare_tokens(self, x):
         B, nc, w, h = x.shape
@@ -211,7 +213,9 @@ class VisionTransformer(nn.Module):
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
-        return x[:, 0]
+
+        x = x[:, :self.num_cls_token]
+        return x
 
     def get_last_selfattention(self, x):
         x = self.prepare_tokens(x)

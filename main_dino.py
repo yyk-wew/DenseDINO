@@ -64,6 +64,9 @@ def get_args_parser():
         We recommend setting a higher value with small batches: for example use 0.9995 with batch size of 256.""")
     parser.add_argument('--use_bn_in_head', default=False, type=utils.bool_flag,
         help="Whether to use batch normalizations in projection head (Default: False)")
+    
+    parser.add_argument('--num_cls_token', default=1, type=int,
+        help="Number of cls_token")
 
     # Temperature teacher parameters
     parser.add_argument('--warmup_teacher_temp', default=0.04, type=float,
@@ -166,8 +169,9 @@ def train_dino(args):
         student = vits.__dict__[args.arch](
             patch_size=args.patch_size,
             drop_path_rate=args.drop_path_rate,  # stochastic depth
+            num_cls_token=args.num_cls_token,
         )
-        teacher = vits.__dict__[args.arch](patch_size=args.patch_size)
+        teacher = vits.__dict__[args.arch](patch_size=args.patch_size, num_cls_token=args.num_cls_token)
         embed_dim = student.embed_dim
     # if the network is a XCiT
     elif args.arch in torch.hub.list("facebookresearch/xcit:main"):
@@ -412,7 +416,7 @@ class DINOLoss(nn.Module):
         """
         Update center used for teacher output.
         """
-        batch_center = torch.sum(teacher_output, dim=0, keepdim=True)
+        batch_center = torch.sum(teacher_output, dim=0, keepdim=True).mean(dim=1, keepdim=False)
         dist.all_reduce(batch_center)
         batch_center = batch_center / (len(teacher_output) * dist.get_world_size())
 
