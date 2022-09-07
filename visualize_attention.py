@@ -17,7 +17,7 @@ import argparse
 import cv2
 import random
 import colorsys
-import requests
+# import requests
 from io import BytesIO
 
 import skimage.io
@@ -109,11 +109,12 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', default='.', help='Path where to save visualizations.')
     parser.add_argument("--threshold", type=float, default=None, help="""We visualize masks
         obtained by thresholding the self-attention maps to keep xx% of the mass.""")
+    parser.add_argument('--num_cls_token', default=1, type=int, help="Number of cls_token")
     args = parser.parse_args()
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     # build model
-    model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0)
+    model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0, num_cls_token=args.num_cls_token)
     for p in model.parameters():
         p.requires_grad = False
     model.eval()
@@ -152,9 +153,10 @@ if __name__ == '__main__':
         # user has not specified any image - we use our own image
         print("Please use the `--image_path` argument to indicate the path of the image you wish to visualize.")
         print("Since no image path have been provided, we take the first image in our paper.")
-        response = requests.get("https://dl.fbaipublicfiles.com/dino/img.png")
-        img = Image.open(BytesIO(response.content))
-        img = img.convert('RGB')
+        # response = requests.get("https://dl.fbaipublicfiles.com/dino/img.png")
+        # img = Image.open(BytesIO(response.content))
+        # img = img.convert('RGB')
+        sys.exit(1)
     elif os.path.isfile(args.image_path):
         with open(args.image_path, 'rb') as f:
             img = Image.open(f)

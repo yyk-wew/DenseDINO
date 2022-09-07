@@ -215,6 +215,11 @@ class VisionTransformer(nn.Module):
         x = self.norm(x)
 
         x = x[:, :self.num_cls_token]
+        
+        if not self.training:
+            B = x.shape[0]
+            x = x.reshape(B, -1)    # concat multiple cls token
+        
         return x
 
     def get_last_selfattention(self, x):
