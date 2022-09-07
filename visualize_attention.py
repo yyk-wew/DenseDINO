@@ -110,6 +110,7 @@ if __name__ == '__main__':
     parser.add_argument("--threshold", type=float, default=None, help="""We visualize masks
         obtained by thresholding the self-attention maps to keep xx% of the mass.""")
     parser.add_argument('--num_cls_token', default=1, type=int, help="Number of cls_token")
+    parser.add_argument('--given_pos', action='store_true', help='Replace cls_pos_embed with patch_pos_embed.')
     args = parser.parse_args()
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -171,6 +172,13 @@ if __name__ == '__main__':
     ])
     img = transform(img)
 
+    # replace cls token
+    if args.given_pos:
+        print("Replace cls_token's position with something else.")
+        print(model.pos_embed[0][0].shape)
+        model.pos_embed[0][0] = 0.
+        model.pos_embed[0] = 0.
+
     # make the image divisible by the patch size
     w, h = img.shape[1] - img.shape[1] % args.patch_size, img.shape[2] - img.shape[2] % args.patch_size
     img = img[:, :w, :h].unsqueeze(0)
@@ -201,13 +209,25 @@ if __name__ == '__main__':
     attentions = attentions.reshape(nh, w_featmap, h_featmap)
     attentions = nn.functional.interpolate(attentions.unsqueeze(0), scale_factor=args.patch_size, mode="nearest")[0].cpu().numpy()
 
+    img = torchvision.utils.make_grid(img, normalize=True, scale_each=True)
+    img = img.squeeze(0).permute(1,2,0).cpu().numpy()
+
     # save attentions heatmaps
     os.makedirs(args.output_dir, exist_ok=True)
-    torchvision.utils.save_image(torchvision.utils.make_grid(img, normalize=True, scale_each=True), os.path.join(args.output_dir, "img.png"))
-    for j in range(nh):
-        fname = os.path.join(args.output_dir, "attn-head" + str(j) + ".png")
-        plt.imsave(fname=fname, arr=attentions[j], format='png')
-        print(f"{fname} saved.")
+    # torchvision.utils.save_image(torchvision.utils.make_grid(img, normalize=True, scale_each=True), os.path.join(args.output_dir, "img.png"))
+    fig, ax = plt.subplots(1, nh+1,figsize=((nh+1)*5, 5))
+    for j in range(nh+1):
+        if j == 0:
+            ax[j].imshow(img)
+        else:
+            ax[j].imshow(attentions[j-1])
+        # plt.imsave(fname=fname, arr=attentions[j], format='png')
+        
+    
+    fname = os.path.join(args.output_dir, "img_att.png")
+    fig.savefig(fname)
+    print(f"{fname} saved.")
+
 
     if args.threshold is not None:
         image = skimage.io.imread(os.path.join(args.output_dir, "img.png"))
