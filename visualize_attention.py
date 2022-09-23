@@ -176,8 +176,11 @@ if __name__ == '__main__':
     if args.given_pos:
         print("Replace cls_token's position with something else.")
         print(model.pos_embed[0][0].shape)
-        model.pos_embed[0][0] = 0.
+        # model.pos_embed[0][0] = model.pos_embed[0][168]
+        # model.pos_embed[0][0] = 0.
         model.pos_embed[0] = 0.
+        model.cls_token[:] = 0.
+        print(model.cls_token)
 
     # make the image divisible by the patch size
     w, h = img.shape[1] - img.shape[1] % args.patch_size, img.shape[2] - img.shape[2] % args.patch_size

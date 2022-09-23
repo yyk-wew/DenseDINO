@@ -30,6 +30,7 @@ import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
 from torchvision.transforms.functional import InterpolationMode
+from torchvision.transforms.functional import resized_crop
 
 import utils
 import vision_transformer as vits
@@ -67,6 +68,7 @@ def get_args_parser():
     
     parser.add_argument('--num_cls_token', default=1, type=int,
         help="Number of cls_token")
+    parser.add_argument('--given_pos', action='store_true', help='Replace cls_pos_embed with interpolated patch_pos_embed.')
 
     # Temperature teacher parameters
     parser.add_argument('--warmup_teacher_temp', default=0.04, type=float,
@@ -170,8 +172,9 @@ def train_dino(args):
             patch_size=args.patch_size,
             drop_path_rate=args.drop_path_rate,  # stochastic depth
             num_cls_token=args.num_cls_token,
+            given_pos=args.given_pos
         )
-        teacher = vits.__dict__[args.arch](patch_size=args.patch_size, num_cls_token=args.num_cls_token)
+        teacher = vits.__dict__[args.arch](patch_size=args.patch_size, num_cls_token=args.num_cls_token, given_pos=args.given_pos)
         embed_dim = student.embed_dim
     # if the network is a XCiT
     elif args.arch in torch.hub.list("facebookresearch/xcit:main"):
@@ -311,7 +314,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
                     fp16_scaler, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
-    for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    for it, ((images, tea_pos, stu_pos), _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
@@ -321,10 +324,17 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
 
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images]
+        tea_pos = [pos.cuda(non_blocking=True) for pos in tea_pos]
+        stu_pos = [pos.cuda(non_blocking=True) for pos in stu_pos]
+
+        # sampling reference point
+        # images: [(2+x) * [B,3,H,W]]
+        # tea_pos: 2 * [B, 2+x, 2], stu_pos: (2+x) * [B, 2, 2]
+
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
-            teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
-            student_output = student(images)
+            teacher_output = teacher(images[:2], tea_pos)  # only the 2 global views pass through the teacher
+            student_output = student(images, stu_pos)
             loss = dino_loss(student_output, teacher_output, epoch)
 
         if not math.isfinite(loss.item()):
@@ -389,6 +399,7 @@ class DINOLoss(nn.Module):
         """
         Cross-entropy between softmax outputs of the teacher and student networks.
         """
+
         student_out = student_output / self.student_temp
         student_out = student_out.chunk(self.ncrops)
 
@@ -404,7 +415,9 @@ class DINOLoss(nn.Module):
                 if v == iq:
                     # we skip cases where student and teacher operate on the same view
                     continue
-                loss = torch.sum(-q * F.log_softmax(student_out[v], dim=-1), dim=-1)
+
+                # Attention: Only fit given-pos case. DO NOT fit multi-token case.
+                loss = torch.sum(-q[:, v] * F.log_softmax(student_out[v][:, iq], dim=-1), dim=-1)
                 total_loss += loss.mean()
                 n_loss_terms += 1
         total_loss /= n_loss_terms
@@ -425,7 +438,7 @@ class DINOLoss(nn.Module):
 
 
 class DataAugmentationDINO(object):
-    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number):
+    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number, min_intersection=0.01):
         flip_and_color_jitter = transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomApply(
@@ -441,35 +454,177 @@ class DataAugmentationDINO(object):
 
         # first global crop
         self.global_transfo1 = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=InterpolationMode.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(1.0),
             normalize,
         ])
+        self.global_crop1 = transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=InterpolationMode.BICUBIC)
         # second global crop
         self.global_transfo2 = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=InterpolationMode.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(0.1),
             utils.Solarization(0.2),
             normalize,
         ])
+        self.global_crop2 = transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=InterpolationMode.BICUBIC)
         # transformation for the local small crops
         self.local_crops_number = local_crops_number
         self.local_transfo = transforms.Compose([
-            transforms.RandomResizedCrop(96, scale=local_crops_scale, interpolation=InterpolationMode.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(p=0.5),
             normalize,
         ])
+        self.local_crop = transforms.RandomResizedCrop(96, scale=local_crops_scale, interpolation=InterpolationMode.BICUBIC)
 
-    def __call__(self, image):
-        crops = []
-        crops.append(self.global_transfo1(image))
-        crops.append(self.global_transfo2(image))
-        for _ in range(self.local_crops_number):
-            crops.append(self.local_transfo(image))
-        return crops
+        self.crop_list = [self.global_crop1, self.global_crop2]
+        self.crop_list.extend([self.local_crop] * self.local_crops_number)
+
+        # params for leopart locating bbox
+        self.min_intersection = min_intersection
+        self.nmb_crops = [2, self.local_crops_number]
+        self.size_crops = [224, 96]
+
+    # def __call__(self, image):
+    #     crops = []
+    #     crops.append(self.global_transfo1(image))
+    #     crops.append(self.global_transfo2(image))
+    #     for _ in range(self.local_crops_number):
+    #         crops.append(self.local_transfo(image))
+    #     return crops
+
+    def __call__(self, sample: torch.Tensor):
+        '''
+        function from Leopart repo on github.
+        Note for gc_bboxes and otc_bboxes. box param: [x1, y1, x2, y2]. x1y1: left top, x2y2: right bottom.
+        gc_bboxes: [2, 2+x, 4], otc_bboxes: [2+x, 2, 4]
+        gc_bboxes[i][j]: The intersection region of i-th global crop and j-th all crop, coordinate of i-th global crop image.
+        otc_bboxes[i][j]: The intersection regions of i-th all crop and j-th global crop, coordinate of i-th all crop image.
+        Key point: The bounding box param is calculate on i-th image.
+        Example:
+            gc_bboxes[0][1] is exactly the same as otc_bboxes[0][1].
+        '''
+        multi_crops = []
+        crop_bboxes = torch.zeros(len(self.crop_list), 4)
+
+        for i, rrc_transform in enumerate(self.crop_list):
+            # Get random crop params
+            y1, x1, h, w = rrc_transform.get_params(sample, rrc_transform.scale, rrc_transform.ratio)
+            if i > 0:
+                # Check whether crop has min overlap with existing global crops. If not resample.
+                while True:
+                    # Calculate intersection between sampled crop and all sampled global crops
+                    bbox = torch.Tensor([x1, y1, x1 + w, y1 + h])
+                    left_top = torch.max(bbox.unsqueeze(0)[:, None, :2],
+                                         crop_bboxes[:min(i, self.nmb_crops[0]), :2])
+                    right_bottom = torch.min(bbox.unsqueeze(0)[:, None, 2:],
+                                             crop_bboxes[:min(i, self.nmb_crops[0]), 2:])
+                    wh = _upcast(right_bottom - left_top).clamp(min=0)
+                    inter = wh[:, :, 0] * wh[:, :, 1]
+
+                    # set min intersection to at least 1% of image area
+                    min_intersection = int((sample.size[0] * sample.size[1]) * self.min_intersection)
+                    # Global crops should have twice the min_intersection with each other
+                    if i in list(range(self.nmb_crops[0])):
+                        min_intersection *= 2
+                    if not torch.all(inter > min_intersection):
+                        y1, x1, h, w = rrc_transform.get_params(sample, rrc_transform.scale, rrc_transform.ratio)
+                    else:
+                        break
+
+            # Apply rrc params and store absolute crop bounding box
+            img = resized_crop(sample, y1, x1, h, w, rrc_transform.size, rrc_transform.interpolation)
+            crop_bboxes[i] = torch.Tensor([x1, y1, x1 + w, y1 + h])
+
+            if i == 0:
+                img = self.global_transfo1(img)
+            elif i == 1:
+                img = self.global_transfo2(img)
+            else:
+                img = self.local_transfo(img)
+
+            multi_crops.append(img)
+
+
+        # Calculate relative bboxes for each crop pair from aboslute bboxes
+        gc_bboxes, otc_bboxes = self.calculate_bboxes(crop_bboxes)
+
+        # # use only 1 global crops and 1 + x local crops info
+        # gc_bboxes = gc_bboxes[0]    # [2+x, 4]
+        # otc_bboxes = otc_bboxes[:, 0, :]    # [2+x, 4]
+
+        ref_pos_gc, ref_pos_otc = self.sampling_reference_point(gc_bboxes, otc_bboxes)
+
+        tea_pos = ref_pos_gc.chunk(2)   # (2, [1, 2+x, 2])
+        stu_pos = ref_pos_otc.chunk(ref_pos_otc.shape[0])   # (2+x, [1, 2, 2])
+
+        tea_pos = list(map(lambda x: x.squeeze(0), tea_pos))
+        stu_pos = list(map(lambda x: x.squeeze(0), stu_pos))
+
+        # multi_crops: List[2+x Tensor[3,H,W]]
+        # ref_pos_gc / ref_pos_otc: Tensor[2+x, 2] 
+        return multi_crops, tea_pos, stu_pos
+
+    def calculate_bboxes(self, crop_bboxes):
+        # 1. Calculate two intersection bboxes for each global crop - other crop pair
+        gc_bboxes = crop_bboxes[:self.nmb_crops[0]]
+        left_top = torch.max(gc_bboxes[:, None, :2], crop_bboxes[:, :2])  # [nmb_crops[0], sum(nmb_crops), 2]
+        right_bottom = torch.min(gc_bboxes[:, None, 2:], crop_bboxes[:, 2:])  # [nmb_crops[0], sum(nmb_crops), 2]
+        # Testing for non-intersecting crops. This should always be true, just as safe-guard.
+        assert torch.all((right_bottom - left_top) > 0)
+
+        # 2. Scale intersection bbox with crop size
+        # Extract height and width of all crop bounding boxes. Each row contains h and w of a crop.
+        ws_hs = torch.stack((crop_bboxes[:, 2] - crop_bboxes[:, 0], crop_bboxes[:, 3] - crop_bboxes[:, 1])).T[:, None]
+
+        # Stack global crop sizes for each bbox dimension
+        crops_sizes = torch.repeat_interleave(torch.Tensor([self.size_crops[0]]), self.nmb_crops[0] * 2)\
+            .reshape(self.nmb_crops[0], 2)
+        if len(self.size_crops) == 2:
+            lc_crops_sizes = torch.repeat_interleave(torch.Tensor([self.size_crops[1]]), self.nmb_crops[1] * 2)\
+                .reshape(self.nmb_crops[1], 2)
+            crops_sizes = torch.cat((crops_sizes, lc_crops_sizes))[:, None]  # [sum(nmb_crops), 1, 2]
+
+        # Calculate x1s and y1s of each crop bbox
+        x1s_y1s = crop_bboxes[:, None, :2]
+
+        # Scale top left and right bottom points by percentage of width and height covered
+        left_top_scaled_gc = crops_sizes[:2] * ((left_top - x1s_y1s[:2]) / ws_hs[:2])
+        right_bottom_scaled_gc = crops_sizes[:2] * ((right_bottom - x1s_y1s[:2]) / ws_hs[:2])
+        left_top_otc_points_per_gc = torch.stack([left_top[i] for i in range(self.nmb_crops[0])], dim=1)
+        right_bottom_otc_points_per_gc = torch.stack([right_bottom[i] for i in range(self.nmb_crops[0])], dim=1)
+        left_top_scaled_otc = crops_sizes * ((left_top_otc_points_per_gc - x1s_y1s) / ws_hs)
+        right_bottom_scaled_otc = crops_sizes * ((right_bottom_otc_points_per_gc - x1s_y1s) / ws_hs)
+
+        # 3. Construct bboxes in x1, y1, x2, y2 format from left top and right bottom points
+        gc_bboxes = torch.cat((left_top_scaled_gc, right_bottom_scaled_gc), dim=2)
+        otc_bboxes = torch.cat((left_top_scaled_otc, right_bottom_scaled_otc), dim=2)
+        return gc_bboxes, otc_bboxes
+    
+    def sampling_reference_point(self, gc_bboxes, otc_bboxes):
+        # gc_bboxes: [2, 2+x, 4], otc_bboxes: [2+x, 2, 4]
+        ref_relate_pos = torch.rand((gc_bboxes.shape[0], gc_bboxes.shape[1], 2))    # [2, 2+x, 2]
+
+        ref_pos_x_gc = (gc_bboxes[:,:,2] - gc_bboxes[:,:,0]) * ref_relate_pos[:,:,0] + gc_bboxes[:,:,0]
+        ref_pos_y_gc = (gc_bboxes[:,:,3] - gc_bboxes[:,:,1]) * ref_relate_pos[:,:,1] + gc_bboxes[:,:,1]
+        ref_pos_gc = torch.stack((ref_pos_x_gc, ref_pos_y_gc), dim=-1)
+        ref_pos_gc = ref_pos_gc / self.size_crops[0] * 2. - 1.
+
+        ref_relate_pos = ref_relate_pos.permute(1,0,2)
+        ref_pos_x_all = (otc_bboxes[:,:,2] - otc_bboxes[:,:,0]) * ref_relate_pos[:,:,0] + otc_bboxes[:,:,0]
+        ref_pos_y_all = (otc_bboxes[:,:,3] - otc_bboxes[:,:,1]) * ref_relate_pos[:,:,1] + otc_bboxes[:,:,1]
+        ref_pos_all = torch.stack((ref_pos_x_all, ref_pos_y_all), dim=-1)
+        size_t = torch.cat((torch.tensor([self.size_crops[0], self.size_crops[0]]), torch.tensor([self.size_crops[1] for i in range(self.local_crops_number)])))
+        ref_pos_all = ref_pos_all / size_t[:,None,None] * 2. - 1.
+
+        # coordinate in x,y format
+        return ref_pos_gc, ref_pos_all
+
+def _upcast(t):
+    # Protects from numerical overflows in multiplications by upcasting to the equivalent higher type
+    if t.is_floating_point():
+        return t if t.dtype in (torch.float32, torch.float64) else t.float()
+    else:
+        return t if t.dtype in (torch.int32, torch.int64) else t.int()
 
 
 if __name__ == '__main__':

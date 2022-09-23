@@ -135,17 +135,20 @@ class VisionTransformer(nn.Module):
     """ Vision Transformer """
     def __init__(self, img_size=[224], patch_size=16, in_chans=3, num_classes=0, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., norm_layer=nn.LayerNorm, num_cls_token=1, **kwargs):
+                 drop_path_rate=0., norm_layer=nn.LayerNorm, num_cls_token=1, given_pos=False, **kwargs):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
         self.num_cls_token = num_cls_token
+        self.given_pos = given_pos
 
         self.patch_embed = PatchEmbed(
             img_size=img_size[0], patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, num_cls_token, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + num_cls_token, embed_dim))
+        self.patch_pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
+        if not given_pos:
+            self.cls_pos_embed = nn.Parameter(torch.zeros(1, num_cls_token, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
@@ -159,7 +162,9 @@ class VisionTransformer(nn.Module):
         # Classifier head
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-        trunc_normal_(self.pos_embed, std=.02)
+        trunc_normal_(self.patch_pos_embed, std=.02)
+        if not given_pos:
+            trunc_normal_(self.cls_pos_embed, std=.02)
         trunc_normal_(self.cls_token, std=.02)
         self.apply(self._init_weights)
 
@@ -174,11 +179,11 @@ class VisionTransformer(nn.Module):
 
     def interpolate_pos_encoding(self, x, w, h):
         npatch = x.shape[1] - self.num_cls_token
-        N = self.pos_embed.shape[1] - self.num_cls_token
+        N = self.patch_pos_embed.shape[1]
         if npatch == N and w == h:
-            return self.pos_embed
-        class_pos_embed = self.pos_embed[:, :self.num_cls_token]
-        patch_pos_embed = self.pos_embed[:, self.num_cls_token:]
+            return self.patch_pos_embed
+        
+        patch_pos_embed = self.patch_pos_embed
         dim = x.shape[-1]
         w0 = w // self.patch_embed.patch_size
         h0 = h // self.patch_embed.patch_size
@@ -193,28 +198,62 @@ class VisionTransformer(nn.Module):
         assert int(w0) == patch_pos_embed.shape[-2] and int(h0) == patch_pos_embed.shape[-1]
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
         # return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1)
-        return torch.cat((class_pos_embed, patch_pos_embed), dim=1)
+        return patch_pos_embed
 
-    def prepare_tokens(self, x):
+    def interpolate_ref_point_pos_encoding(self, x, pos):
+        # pos: [B, x, 2]
+        # return: [B, x, embed]
+
+        N = self.patch_pos_embed.shape[1]
+        dim = self.patch_pos_embed.shape[-1]
+        B = x.shape[0]
+        # patch_pos_embed: [B, C, H, W]
+        patch_pos_embed = self.patch_pos_embed.reshape(1, int(math.sqrt(N)), int(math.sqrt(N)), dim).permute(0, 3, 1, 2).expand(B, -1, -1, -1)
+        grid = pos[:,None,:,:]
+        
+        cls_pos_embed = nn.functional.grid_sample(input=patch_pos_embed, grid=pos[:,None,:,:], mode='bicubic')  # [B, C, 1, x]
+        cls_pos_embed = cls_pos_embed.squeeze(2).permute(0, 2, 1)   # [B, x, C]
+
+        return cls_pos_embed        
+
+    def prepare_tokens(self, x, pos=None):
         B, nc, w, h = x.shape
         x = self.patch_embed(x)  # patch linear embedding
 
         # add the [CLS] token to the embed patch tokens
-        cls_tokens = self.cls_token.expand(B, -1, -1)
+        if self.given_pos:
+            assert self.num_cls_token == 1
+            cls_tokens = self.cls_token.expand(B, pos.shape[1], -1)
+        else:
+            cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
 
+        # interpolate patch positional encoding
+        patch_pos = self.interpolate_pos_encoding(x, w, h)
+        
+        # add CLS positional encoding
+        if self.given_pos:
+            cls_pos_embed = self.interpolate_ref_point_pos_encoding(x, pos)
+            pos_embed = torch.cat((cls_pos_embed, patch_pos.expand(B, -1, -1)), dim=1)
+        else:
+            pos_embed = torch.cat((self.cls_pos_embed, patch_pos), dim=1).expand(B, -1, -1)
+
         # add positional encoding to each token
-        x = x + self.interpolate_pos_encoding(x, w, h)
+        x = x + pos_embed
 
         return self.pos_drop(x)
 
-    def forward(self, x):
-        x = self.prepare_tokens(x)
+    def forward(self, x, pos=None):
+        x = self.prepare_tokens(x, pos)
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
 
-        x = x[:, :self.num_cls_token]
+        num_cls_token = pos.shape[1]
+        x = x[:, :num_cls_token]
+
+        # if self.given_pos:
+        #     return x.chunk(num_cls_token, dim=1)            
         
         if not self.training:
             B = x.shape[0]
