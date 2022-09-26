@@ -69,6 +69,7 @@ def get_args_parser():
     parser.add_argument('--num_cls_token', default=1, type=int,
         help="Number of cls_token")
     parser.add_argument('--given_pos', action='store_true', help='Replace cls_pos_embed with interpolated patch_pos_embed.')
+    parser.add_argument('--with_cls_token', action='store_true', help='With learnable class token.')
 
     # Temperature teacher parameters
     parser.add_argument('--warmup_teacher_temp', default=0.04, type=float,
@@ -172,9 +173,10 @@ def train_dino(args):
             patch_size=args.patch_size,
             drop_path_rate=args.drop_path_rate,  # stochastic depth
             num_cls_token=args.num_cls_token,
-            given_pos=args.given_pos
+            given_pos=args.given_pos,
+            with_cls_token=args.with_cls_token
         )
-        teacher = vits.__dict__[args.arch](patch_size=args.patch_size, num_cls_token=args.num_cls_token, given_pos=args.given_pos)
+        teacher = vits.__dict__[args.arch](patch_size=args.patch_size, num_cls_token=args.num_cls_token, given_pos=args.given_pos, with_cls_token=args.with_cls_token)
         embed_dim = student.embed_dim
     # if the network is a XCiT
     elif args.arch in torch.hub.list("facebookresearch/xcit:main"):

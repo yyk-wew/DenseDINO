@@ -135,17 +135,21 @@ class VisionTransformer(nn.Module):
     """ Vision Transformer """
     def __init__(self, img_size=[224], patch_size=16, in_chans=3, num_classes=0, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., norm_layer=nn.LayerNorm, num_cls_token=1, given_pos=False, **kwargs):
+                 drop_path_rate=0., norm_layer=nn.LayerNorm, num_cls_token=1, given_pos=False, with_cls_token=True, **kwargs):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
         self.num_cls_token = num_cls_token
         self.given_pos = given_pos
+        self.with_cls_token = with_cls_token
 
         self.patch_embed = PatchEmbed(
             img_size=img_size[0], patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
 
-        self.cls_token = nn.Parameter(torch.zeros(1, num_cls_token, embed_dim))
+        print("If with class token:", with_cls_token)
+        if with_cls_token:
+            self.cls_token = nn.Parameter(torch.zeros(1, num_cls_token, embed_dim))
+        
         self.patch_pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
         if not given_pos:
             self.cls_pos_embed = nn.Parameter(torch.zeros(1, num_cls_token, embed_dim))
@@ -165,7 +169,8 @@ class VisionTransformer(nn.Module):
         trunc_normal_(self.patch_pos_embed, std=.02)
         if not given_pos:
             trunc_normal_(self.cls_pos_embed, std=.02)
-        trunc_normal_(self.cls_token, std=.02)
+        if with_cls_token:
+            trunc_normal_(self.cls_token, std=.02)
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -177,8 +182,8 @@ class VisionTransformer(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def interpolate_pos_encoding(self, x, w, h):
-        npatch = x.shape[1] - self.num_cls_token
+    def interpolate_pos_encoding(self, x, w, h, num_cls_token):
+        npatch = x.shape[1] - num_cls_token
         N = self.patch_pos_embed.shape[1]
         if npatch == N and w == h:
             return self.patch_pos_embed
@@ -200,16 +205,15 @@ class VisionTransformer(nn.Module):
         # return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1)
         return patch_pos_embed
 
-    def interpolate_ref_point_pos_encoding(self, x, pos):
+    def interpolate_ref_point_pos_encoding(self, x, pos, patch_pos_embed):
         # pos: [B, x, 2]
         # return: [B, x, embed]
 
-        N = self.patch_pos_embed.shape[1]
-        dim = self.patch_pos_embed.shape[-1]
+        N = patch_pos_embed.shape[1]
+        dim = patch_pos_embed.shape[-1]
         B = x.shape[0]
         # patch_pos_embed: [B, C, H, W]
-        patch_pos_embed = self.patch_pos_embed.reshape(1, int(math.sqrt(N)), int(math.sqrt(N)), dim).permute(0, 3, 1, 2).expand(B, -1, -1, -1)
-        grid = pos[:,None,:,:]
+        patch_pos_embed = patch_pos_embed.reshape(1, int(math.sqrt(N)), int(math.sqrt(N)), dim).permute(0, 3, 1, 2).expand(B, -1, -1, -1)
         
         cls_pos_embed = nn.functional.grid_sample(input=patch_pos_embed, grid=pos[:,None,:,:], mode='bicubic')  # [B, C, 1, x]
         cls_pos_embed = cls_pos_embed.squeeze(2).permute(0, 2, 1)   # [B, x, C]
@@ -223,17 +227,22 @@ class VisionTransformer(nn.Module):
         # add the [CLS] token to the embed patch tokens
         if self.given_pos:
             assert self.num_cls_token == 1
-            cls_tokens = self.cls_token.expand(B, pos.shape[1], -1)
+            num_cls_token = pos.shape[1]
+            if self.with_cls_token:   
+                cls_tokens = self.cls_token.expand(B, num_cls_token, -1)
+            else:
+                cls_tokens = torch.zeros((B, num_cls_token, self.embed_dim)).cuda()
         else:
+            num_cls_token = self.num_cls_token
             cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
 
         # interpolate patch positional encoding
-        patch_pos = self.interpolate_pos_encoding(x, w, h)
+        patch_pos = self.interpolate_pos_encoding(x, w, h, num_cls_token)
         
         # add CLS positional encoding
         if self.given_pos:
-            cls_pos_embed = self.interpolate_ref_point_pos_encoding(x, pos)
+            cls_pos_embed = self.interpolate_ref_point_pos_encoding(x, pos, patch_pos)
             pos_embed = torch.cat((cls_pos_embed, patch_pos.expand(B, -1, -1)), dim=1)
         else:
             pos_embed = torch.cat((self.cls_pos_embed, patch_pos), dim=1).expand(B, -1, -1)
