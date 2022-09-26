@@ -146,7 +146,6 @@ class VisionTransformer(nn.Module):
             img_size=img_size[0], patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
 
-        print("If with class token:", with_cls_token)
         if with_cls_token:
             self.cls_token = nn.Parameter(torch.zeros(1, num_cls_token, embed_dim))
         

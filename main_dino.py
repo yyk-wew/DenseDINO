@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
 from torchvision.transforms.functional import InterpolationMode
-from torchvision.transforms.functional import resized_crop
+from torchvision.transforms.functional import resized_crop, hflip
 
 import utils
 import vision_transformer as vits
@@ -441,8 +441,8 @@ class DINOLoss(nn.Module):
 
 class DataAugmentationDINO(object):
     def __init__(self, global_crops_scale, local_crops_scale, local_crops_number, min_intersection=0.01):
-        flip_and_color_jitter = transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.5),
+        # flip = transforms.RandomHorizontalFlip(p=0.5)
+        color_jitter = transforms.Compose([    
             transforms.RandomApply(
                 [transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
                 p=0.8
@@ -456,14 +456,14 @@ class DataAugmentationDINO(object):
 
         # first global crop
         self.global_transfo1 = transforms.Compose([
-            flip_and_color_jitter,
+            color_jitter,
             utils.GaussianBlur(1.0),
             normalize,
         ])
         self.global_crop1 = transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=InterpolationMode.BICUBIC)
         # second global crop
         self.global_transfo2 = transforms.Compose([
-            flip_and_color_jitter,
+            color_jitter,
             utils.GaussianBlur(0.1),
             utils.Solarization(0.2),
             normalize,
@@ -472,7 +472,7 @@ class DataAugmentationDINO(object):
         # transformation for the local small crops
         self.local_crops_number = local_crops_number
         self.local_transfo = transforms.Compose([
-            flip_and_color_jitter,
+            color_jitter,
             utils.GaussianBlur(p=0.5),
             normalize,
         ])
@@ -507,6 +507,7 @@ class DataAugmentationDINO(object):
         '''
         multi_crops = []
         crop_bboxes = torch.zeros(len(self.crop_list), 4)
+        flip_record = []
 
         for i, rrc_transform in enumerate(self.crop_list):
             # Get random crop params
@@ -537,6 +538,13 @@ class DataAugmentationDINO(object):
             img = resized_crop(sample, y1, x1, h, w, rrc_transform.size, rrc_transform.interpolation)
             crop_bboxes[i] = torch.Tensor([x1, y1, x1 + w, y1 + h])
 
+            # Apply flip
+            flip_flag = torch.rand(1) < 0.5
+            flip_record.append(flip_flag)
+            if flip_flag:
+                img = hflip(img)
+                # crop_bboxes[i][0] = rrc_transform.size[1] - crop_bboxes[i][2]
+
             if i == 0:
                 img = self.global_transfo1(img)
             elif i == 1:
@@ -550,17 +558,27 @@ class DataAugmentationDINO(object):
         # Calculate relative bboxes for each crop pair from aboslute bboxes
         gc_bboxes, otc_bboxes = self.calculate_bboxes(crop_bboxes)
 
-        # # use only 1 global crops and 1 + x local crops info
-        # gc_bboxes = gc_bboxes[0]    # [2+x, 4]
-        # otc_bboxes = otc_bboxes[:, 0, :]    # [2+x, 4]
-
         ref_pos_gc, ref_pos_otc = self.sampling_reference_point(gc_bboxes, otc_bboxes)
 
         tea_pos = ref_pos_gc.chunk(2)   # (2, [1, 2+x, 2])
         stu_pos = ref_pos_otc.chunk(ref_pos_otc.shape[0])   # (2+x, [1, 2, 2])
 
+        # Adjust reference point coordinate according to flip
+        for i in range(len(flip_record)):
+            if flip_record[i]:
+                if i < 2:
+                    tea_pos[i][:,:,0] = -tea_pos[i][:,:,0]
+                    stu_pos[i][:,:,0] = -stu_pos[i][:,:,0]
+                else:
+                    stu_pos[i][:,:,0] = -stu_pos[i][:,:,0]          
+
         tea_pos = list(map(lambda x: x.squeeze(0), tea_pos))
         stu_pos = list(map(lambda x: x.squeeze(0), stu_pos))
+
+        # --Important--
+        # flip_record contains flip_flag, which is a tensor
+        # Memory leak occurs without del
+        del flip_record
 
         # multi_crops: List[2+x Tensor[3,H,W]]
         # ref_pos_gc / ref_pos_otc: Tensor[2+x, 2] 
