@@ -572,13 +572,14 @@ class DataAugmentationDINO(object):
                 else:
                     stu_pos[i][:,:,0] = -stu_pos[i][:,:,0]          
 
-        tea_pos = list(map(lambda x: x.squeeze(0), tea_pos))
-        stu_pos = list(map(lambda x: x.squeeze(0), stu_pos))
+        tea_pos = list(map(lambda x: x.squeeze(0).detach(), tea_pos))
+        stu_pos = list(map(lambda x: x.squeeze(0).detach(), stu_pos))
 
         # --Important--
         # flip_record contains flip_flag, which is a tensor
         # Memory leak occurs without del
         del flip_record
+        del gc_bboxes, otc_bboxes
 
         # multi_crops: List[2+x Tensor[3,H,W]]
         # ref_pos_gc / ref_pos_otc: Tensor[2+x, 2] 

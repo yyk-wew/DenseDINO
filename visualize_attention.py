@@ -111,11 +111,12 @@ if __name__ == '__main__':
         obtained by thresholding the self-attention maps to keep xx% of the mass.""")
     parser.add_argument('--num_cls_token', default=1, type=int, help="Number of cls_token")
     parser.add_argument('--given_pos', action='store_true', help='Replace cls_pos_embed with patch_pos_embed.')
+    parser.add_argument('--with_cls_token', action='store_true', help='With learnable class token.')
     args = parser.parse_args()
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     # build model
-    model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0, num_cls_token=args.num_cls_token)
+    model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0, num_cls_token=args.num_cls_token, given_pos=args.given_pos, with_cls_token=args.with_cls_token)
     for p in model.parameters():
         p.requires_grad = False
     model.eval()
@@ -174,13 +175,15 @@ if __name__ == '__main__':
 
     # replace cls token
     if args.given_pos:
-        print("Replace cls_token's position with something else.")
-        print(model.pos_embed[0][0].shape)
-        # model.pos_embed[0][0] = model.pos_embed[0][168]
-        # model.pos_embed[0][0] = 0.
-        model.pos_embed[0] = 0.
-        model.cls_token[:] = 0.
-        print(model.cls_token)
+        # print("Replace cls_token's position with something else.")
+        # print(model.pos_embed[0][0].shape)
+        # model.pos_embed[0] = 0.
+        # model.cls_token[:] = 0.
+        # print(model.cls_token)
+        pos = torch.Tensor([-0.5, 0.56])[None,None,:]   # [B, num_cls_token, 2] [x,y]
+        print(pos.shape)
+    else:
+        pos = None
 
     # make the image divisible by the patch size
     w, h = img.shape[1] - img.shape[1] % args.patch_size, img.shape[2] - img.shape[2] % args.patch_size
@@ -189,7 +192,8 @@ if __name__ == '__main__':
     w_featmap = img.shape[-2] // args.patch_size
     h_featmap = img.shape[-1] // args.patch_size
 
-    attentions = model.get_last_selfattention(img.to(device))
+    # attentions: [B, h, N, N], h: heads num, N: patch num. 
+    attentions = model.get_last_selfattention(img.to(device), pos.to(device))
 
     nh = attentions.shape[1] # number of head
 
