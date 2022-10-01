@@ -66,8 +66,6 @@ def get_args_parser():
     parser.add_argument('--use_bn_in_head', default=False, type=utils.bool_flag,
         help="Whether to use batch normalizations in projection head (Default: False)")
     
-    parser.add_argument('--num_cls_token', default=1, type=int,
-        help="Number of cls_token")
     parser.add_argument('--given_pos', action='store_true', help='Replace cls_pos_embed with interpolated patch_pos_embed.')
     parser.add_argument('--with_cls_token', action='store_true', help='With learnable class token.')
 
@@ -172,11 +170,10 @@ def train_dino(args):
         student = vits.__dict__[args.arch](
             patch_size=args.patch_size,
             drop_path_rate=args.drop_path_rate,  # stochastic depth
-            num_cls_token=args.num_cls_token,
             given_pos=args.given_pos,
             with_cls_token=args.with_cls_token
         )
-        teacher = vits.__dict__[args.arch](patch_size=args.patch_size, num_cls_token=args.num_cls_token, given_pos=args.given_pos, with_cls_token=args.with_cls_token)
+        teacher = vits.__dict__[args.arch](patch_size=args.patch_size, given_pos=args.given_pos, with_cls_token=args.with_cls_token)
         embed_dim = student.embed_dim
     # if the network is a XCiT
     elif args.arch in torch.hub.list("facebookresearch/xcit:main"):
@@ -337,7 +334,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         with torch.cuda.amp.autocast(fp16_scaler is not None):
             teacher_output = teacher(images[:2], tea_pos)  # only the 2 global views pass through the teacher
             student_output = student(images, stu_pos)
-            loss = dino_loss(student_output, teacher_output, epoch)
+            loss = dino_loss(student_output, teacher_output, epoch, args.given_pos)
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()), force=True)
@@ -397,7 +394,7 @@ class DINOLoss(nn.Module):
             np.ones(nepochs - warmup_teacher_temp_epochs) * teacher_temp
         ))
 
-    def forward(self, student_output, teacher_output, epoch):
+    def forward(self, student_output, teacher_output, epoch, given_pos=False):
         """
         Cross-entropy between softmax outputs of the teacher and student networks.
         """
@@ -417,11 +414,16 @@ class DINOLoss(nn.Module):
                 if v == iq:
                     # we skip cases where student and teacher operate on the same view
                     continue
-
-                # Attention: Only fit given-pos case. DO NOT fit multi-token case.
-                loss = torch.sum(-q[:, v] * F.log_softmax(student_out[v][:, iq], dim=-1), dim=-1)
+                # global cls token loss
+                loss = torch.sum(-q[:, 0] * F.log_softmax(student_out[v][:, 0], dim=-1), dim=-1)
                 total_loss += loss.mean()
                 n_loss_terms += 1
+                
+                # given position token loss
+                if given_pos:
+                    loss = torch.sum(-q[:, v+1] * F.log_softmax(student_out[v][:, iq+1], dim=-1), dim=-1)
+                    total_loss += loss.mean()
+                    n_loss_terms += 1
         total_loss /= n_loss_terms
         self.update_center(teacher_output)
         return total_loss
