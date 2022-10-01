@@ -254,7 +254,10 @@ class VisionTransformer(nn.Module):
         x = self.norm(x)
 
         num_cls_token = pos.shape[1] + 1 if self.given_pos else 1
-        x = x[:, :num_cls_token]          
+        x = x[:, :num_cls_token]
+
+        if not self.training:
+            x = x.squeeze(1)    
         
         return x
 

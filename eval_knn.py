@@ -57,7 +57,7 @@ def extract_feature_pipeline(args):
 
     # ============ building network ... ============
     if "vit" in args.arch:
-        model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0, num_cls_token=args.num_cls_token)
+        model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0, given_pos=args.given_pos, with_cls_token=args.with_cls_token)
         print(f"Model {args.arch} {args.patch_size}x{args.patch_size} built.")
     elif "xcit" in args.arch:
         model = torch.hub.load('facebookresearch/xcit:main', args.arch, num_classes=0)
@@ -211,7 +211,10 @@ if __name__ == '__main__':
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
     parser.add_argument('--data_path', default='/path/to/imagenet/', type=str)
-    parser.add_argument('--num_cls_token', default=1, type=int, help="Number of cls_token")
+    # --- new ---
+    parser.add_argument('--given_pos', action='store_true', help='Replace cls_pos_embed with interpolated patch_pos_embed.')
+    parser.add_argument('--with_cls_token', action='store_true', help='With learnable class token.')
+    # -----------
     args = parser.parse_args()
 
     utils.init_distributed_mode(args)
