@@ -225,7 +225,7 @@ class VisionTransformer(nn.Module):
                 cls_tokens = self.cls_token.expand(1, num_cls_token, -1)
             else:
                 cls_tokens = torch.zeros((1, num_cls_token - 1, self.embed_dim)).to(self.cls_token.device)
-                cls_tokens = torch.cat(self.cls_token, cls_tokens, dim=1)
+                cls_tokens = torch.cat((self.cls_token, cls_tokens), dim=1)
         else:
             num_cls_token = 1
             cls_tokens = self.cls_token
