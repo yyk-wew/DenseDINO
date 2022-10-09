@@ -106,12 +106,14 @@ if __name__ == '__main__':
         help='Key to use in the checkpoint (example: "teacher")')
     parser.add_argument("--image_path", default=None, type=str, help="Path of the image to load.")
     parser.add_argument("--image_size", default=(480, 480), type=int, nargs="+", help="Resize image.")
-    parser.add_argument('--output_dir', default='.', help='Path where to save visualizations.')
+    parser.add_argument('--output_name', default='.', help='Path where to save visualizations.')
     parser.add_argument("--threshold", type=float, default=None, help="""We visualize masks
         obtained by thresholding the self-attention maps to keep xx% of the mass.""")
     parser.add_argument('--num_cls_token', default=1, type=int, help="Number of cls_token")
     parser.add_argument('--given_pos', action='store_true', help='Replace cls_pos_embed with patch_pos_embed.')
     parser.add_argument('--with_cls_token', action='store_true', help='With learnable class token.')
+    parser.add_argument('--token_index', type=int, default=0, help='Token used for visualization.')
+    parser.add_argument('--ref_coord', type=float, nargs='+', default=(0.0, 0.0), help='Coordinate of reference point, in (x,y) format.')
     args = parser.parse_args()
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -180,7 +182,7 @@ if __name__ == '__main__':
         # model.pos_embed[0] = 0.
         # model.cls_token[:] = 0.
         # print(model.cls_token)
-        pos = torch.Tensor([-0.5, 0.56])[None,None,:]   # [B, num_cls_token, 2] [x,y]
+        pos = torch.Tensor(args.ref_coord)[None,None,:]   # [B, num_cls_token, 2] [x,y]
         print(pos.shape)
     else:
         pos = None
@@ -193,12 +195,20 @@ if __name__ == '__main__':
     h_featmap = img.shape[-1] // args.patch_size
 
     # attentions: [B, h, N, N], h: heads num, N: patch num. 
-    attentions = model.get_last_selfattention(img.to(device), pos.to(device))
+    attentions = model.get_last_selfattention(img.to(device), pos.to(device) if pos is not None else None)
 
     nh = attentions.shape[1] # number of head
+    print("Attention shape", attentions.shape)
 
     # we keep only the output patch attention
-    attentions = attentions[0, :, 0, 1:].reshape(nh, -1)
+    attentions = attentions[0, :, args.token_index, -196:].reshape(nh, -1)
+
+    # get output
+    output_tokens = model.get_intermediate_layers(img.to(device), pos.to(device) if pos is not None else None)[0][0]
+    output_tokens = torch.nn.functional.normalize(output_tokens, dim=-1, p=2)
+    target_token = output_tokens[args.token_index]  # [1, D]
+    patch_tokens = output_tokens[-196:]     # [196, D]
+    sim_mat = (target_token @ patch_tokens.T).reshape(w_featmap, h_featmap).cpu().numpy()
 
     if args.threshold is not None:
         # we keep only a certain percentage of the mass
@@ -220,23 +230,28 @@ if __name__ == '__main__':
     img = img.squeeze(0).permute(1,2,0).cpu().numpy()
 
     # save attentions heatmaps
-    os.makedirs(args.output_dir, exist_ok=True)
+    output_dir = os.path.join(os.path.dirname(args.pretrained_weights), 'vis_att')
+    os.makedirs(output_dir, exist_ok=True)
     # torchvision.utils.save_image(torchvision.utils.make_grid(img, normalize=True, scale_each=True), os.path.join(args.output_dir, "img.png"))
-    fig, ax = plt.subplots(1, nh+1,figsize=((nh+1)*5, 5))
-    for j in range(nh+1):
+    fig, ax = plt.subplots(1, nh+2,figsize=((nh+2)*5, 5))
+    for j in range(nh+2):
         if j == 0:
             ax[j].imshow(img)
-        else:
+            if args.given_pos:
+                pos = (pos + 1.) / 2. * 224.
+                ax[j].scatter(pos[0][0][0], pos[0][0][1], marker='o', c='red')
+        elif j < nh+1:
             ax[j].imshow(attentions[j-1])
+        else:
+            ax[j].imshow(sim_mat, interpolation='nearest')
         # plt.imsave(fname=fname, arr=attentions[j], format='png')
-        
     
-    fname = os.path.join(args.output_dir, "img_att.png")
+    fname = os.path.join(output_dir, args.output_name)
     fig.savefig(fname)
     print(f"{fname} saved.")
 
 
     if args.threshold is not None:
-        image = skimage.io.imread(os.path.join(args.output_dir, "img.png"))
+        image = skimage.io.imread(os.path.join(output_dir, "img.png"))
         for j in range(nh):
-            display_instances(image, th_attn[j], fname=os.path.join(args.output_dir, "mask_th" + str(args.threshold) + "_head" + str(j) +".png"), blur=False)
+            display_instances(image, th_attn[j], fname=os.path.join(output_dir, "mask_th" + str(args.threshold) + "_head" + str(j) +".png"), blur=False)
