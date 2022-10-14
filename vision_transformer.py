@@ -200,17 +200,19 @@ class VisionTransformer(nn.Module):
         return patch_pos_embed
 
     def interpolate_ref_point_pos_encoding(self, x, pos, patch_pos_embed):
-        # pos: [B, x, 2]
-        # return: [B, x, embed]
+        # patch_pos_embed: [1, N, embed]
+        # pos: [B, x, k, 2]
+        # return: [B, x, k, embed]
 
         N = patch_pos_embed.shape[1]
         dim = patch_pos_embed.shape[-1]
         B = x.shape[0]
-        # patch_pos_embed: [B, C, H, W]
-        patch_pos_embed = patch_pos_embed.reshape(1, int(math.sqrt(N)), int(math.sqrt(N)), dim).permute(0, 3, 1, 2).expand(B, -1, -1, -1)
         
-        cls_pos_embed = nn.functional.grid_sample(input=patch_pos_embed, grid=pos[:,None,:,:], mode='bicubic')  # [B, C, 1, x]
-        cls_pos_embed = cls_pos_embed.squeeze(2).permute(0, 2, 1)   # [B, x, C]
+        patch_pos_embed = patch_pos_embed.reshape(1, int(math.sqrt(N)), int(math.sqrt(N)), dim).permute(0, 3, 1, 2).expand(B, -1, -1, -1)
+        # patch_pos_embed: [B, embed, H, W]
+
+        cls_pos_embed = nn.functional.grid_sample(input=patch_pos_embed, grid=pos, mode='bicubic')  # [B, embed, x, k]
+        cls_pos_embed = cls_pos_embed.flatten(2,3).permute(0, 2, 1)   # [B, x*k, embed]
 
         return cls_pos_embed        
 
@@ -220,7 +222,7 @@ class VisionTransformer(nn.Module):
 
         # add the [CLS] token to the embed patch tokens
         if self.given_pos:
-            num_cls_token = pos.shape[1] + 1
+            num_cls_token = pos.shape[1] * pos.shape[2] + 1
             if self.with_cls_token:   
                 cls_tokens = self.cls_token.expand(1, num_cls_token, -1)
             else:
@@ -253,10 +255,12 @@ class VisionTransformer(nn.Module):
             x = blk(x)
         x = self.norm(x)
 
-        num_cls_token = pos.shape[1] + 1 if self.given_pos else 1
+        num_cls_token = pos.shape[1] * pos.shape[2] + 1 if self.given_pos else 1
         x = x[:, :num_cls_token]
 
-        if not self.training:
+        if self.training:
+            pass
+        else:
             x = x.squeeze(1)    
         
         return x

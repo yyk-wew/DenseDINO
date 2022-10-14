@@ -182,8 +182,7 @@ if __name__ == '__main__':
         # model.pos_embed[0] = 0.
         # model.cls_token[:] = 0.
         # print(model.cls_token)
-        pos = torch.Tensor(args.ref_coord)[None,None,:]   # [B, num_cls_token, 2] [x,y]
-        print(pos.shape)
+        pos = torch.Tensor(args.ref_coord)[None,None,None,:]   # [B, 1, 1, 2] [x,y]
     else:
         pos = None
 
@@ -239,7 +238,7 @@ if __name__ == '__main__':
             ax[j].imshow(img)
             if args.given_pos:
                 pos = (pos + 1.) / 2. * 224.
-                ax[j].scatter(pos[0][0][0], pos[0][0][1], marker='o', c='red')
+                ax[j].scatter(pos[0][0][0][0], pos[0][0][0][1], marker='o', c='red')
         elif j < nh+1:
             ax[j].imshow(attentions[j-1])
         else:

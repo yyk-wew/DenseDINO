@@ -70,6 +70,8 @@ def get_args_parser():
     parser.add_argument('--given_pos', action='store_true', help='Replace cls_pos_embed with interpolated patch_pos_embed.')
     parser.add_argument('--with_cls_token', action='store_true', help='Reference token shared learnable class token.')
     parser.add_argument('--another_center', action='store_true', help='Use separate centering for given_pos_token.')
+    parser.add_argument('--num_reference', default=1, type=int, help="Number of points sampled per crop. Use k*k points in actual.")
+    parser.add_argument('--sampling_mode', type=str, default='random', choices=['random', 'grid'], help='Mode of reference point sampling.')
 
     # Temperature teacher parameters
     parser.add_argument('--warmup_teacher_temp', default=0.04, type=float,
@@ -151,6 +153,8 @@ def train_dino(args):
         args.global_crops_scale,
         args.local_crops_scale,
         args.local_crops_number,
+        args.num_reference,
+        args.sampling_mode
     )
     dataset = datasets.ImageFolder(args.data_path, transform=transform)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
@@ -331,13 +335,13 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
 
         # sampling reference point
         # images: [(2+x) * [B,3,H,W]]
-        # tea_pos: 2 * [B, 2+x, 2], stu_pos: (2+x) * [B, 2, 2]
+        # tea_pos: 2 * [B, 2+x, k*k, 2], stu_pos: (2+x) * [B, 2, K*k, 2]
 
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
             teacher_output = teacher(images[:2], tea_pos)  # only the 2 global views pass through the teacher
             student_output = student(images, stu_pos)
-            loss = dino_loss(student_output, teacher_output, epoch, args.given_pos)
+            loss, global_loss, ref_loss = dino_loss(student_output, teacher_output, epoch, args.given_pos)
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()), force=True)
@@ -371,7 +375,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
 
         # logging
         torch.cuda.synchronize()
-        metric_logger.update(loss=loss.item())
+        metric_logger.update(loss=loss.item(), global_loss=global_loss.item(), ref_loss=ref_loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
     # gather the stats from all processes
@@ -404,39 +408,42 @@ class DINOLoss(nn.Module):
         """
         Cross-entropy between softmax outputs of the teacher and student networks.
         """
+        if given_pos:
+            num_ref_point = student_output.shape[1] // 2
 
-        # student_out = student_output / self.student_temp
-        student_out = student_output.chunk(self.ncrops)
+        student_out = student_output / self.student_temp
+        student_out_global = student_out[:,0].chunk(self.ncrops) # [2+x, [B, dim]]
+        if given_pos:
+            student_out_ref = student_out[:,1:].unflatten(1, (2,num_ref_point)).chunk(self.ncrops)   # [2+x, [B, 2, k, dim]]
 
         # teacher centering and sharpening
         temp = self.teacher_temp_schedule[epoch]
         # teacher_out = F.softmax((teacher_output - self.center) / temp, dim=-1)
-        teacher_out = teacher_output.detach().chunk(2)
+        teacher_out_global = F.softmax((teacher_output[:,0] - self.center) / temp, dim=-1).detach().chunk(2)  # [2, [B, dim]]
+        if given_pos:
+            teacher_out_ref_temp = teacher_output[:,1:].unflatten(1, (self.ncrops,num_ref_point))  # [2B, 2+x, k, dim]
+            if self.another_center:
+                teacher_out_ref_temp = F.softmax((teacher_out_ref_temp - self.ref_center) / temp, dim=-1)
+            else:
+                teacher_out_ref_temp = F.softmax((teacher_out_ref_temp - self.center) / temp, dim=-1)
+            teacher_out_ref = teacher_out_ref_temp.detach().chunk(2) # [2, [B, 2+x, k, dim]]
 
         global_loss, ref_loss = 0, 0
         global_n_loss_terms, ref_n_loss_terms = 0, 0
-        for iq, q in enumerate(teacher_out):
-            for v in range(len(student_out)):
+
+        for iq in range(2): # 2 == len(teacher_out_global)
+            for v in range(self.ncrops):    # self.ncrops == len(student_out_global)
                 if v == iq:
                     # we skip cases where student and teacher operate on the same view
                     continue
                 # global cls token loss
-                student_out_global = student_out[v][:, 0] / self.student_temp
-                teacher_out_global = q[:, 0]
-                teacher_out_global = F.softmax((teacher_out_global - self.center) / temp, dim=-1)
-                loss = torch.sum(-teacher_out_global * F.log_softmax(student_out_global, dim=-1), dim=-1)
+                loss = torch.sum(-teacher_out_global[iq] * F.log_softmax(student_out_global[v], dim=-1), dim=-1)
                 global_loss += loss.mean()
                 global_n_loss_terms += 1
                 
                 # given position token loss
                 if given_pos:
-                    student_out_ref = student_out[v][:, iq+1] / self.student_temp
-                    teacher_out_ref = q[:, v+1]
-                    if self.another_center:
-                        teacher_out_ref = F.softmax((teacher_out_ref - self.ref_center) / temp, dim=-1)
-                    else:
-                        teacher_out_ref = F.softmax((teacher_out_ref - self.center) / temp, dim=-1)
-                    loss = torch.sum(-teacher_out_ref * F.log_softmax(student_out_ref, dim=-1), dim=-1)
+                    loss = torch.sum(-teacher_out_ref[iq][:,v] * F.log_softmax(student_out_ref[v][:, iq], dim=-1), dim=-1)  # [B, k]
                     ref_loss += loss.mean()
                     ref_n_loss_terms += 1
         global_loss /= global_n_loss_terms
@@ -444,7 +451,7 @@ class DINOLoss(nn.Module):
         total_loss = 0.5 * global_loss + 0.5 * ref_loss
 
         self.update_center(teacher_output)
-        return total_loss
+        return total_loss, global_loss, ref_loss
 
     @torch.no_grad()
     def update_center(self, teacher_output):
@@ -455,7 +462,7 @@ class DINOLoss(nn.Module):
         dist.all_reduce(batch_center)
         batch_center = batch_center / (len(teacher_output) * dist.get_world_size())
 
-        # batch_center: [1, 2+x+1, D]
+        # batch_center: [1, 1+(2+x)*k, D]
 
         # ema update
         self.center = self.center * self.center_momentum + batch_center[:, 0] * (1 - self.center_momentum)
@@ -464,7 +471,10 @@ class DINOLoss(nn.Module):
 
 
 class DataAugmentationDINO(object):
-    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number, min_intersection=0.01):
+    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number, num_reference, sampling_mode, min_intersection=0.01):
+        self.num_reference = num_reference
+        self.sampling_mode = sampling_mode
+
         # flip = transforms.RandomHorizontalFlip(p=0.5)
         color_jitter = transforms.Compose([    
             transforms.RandomApply(
@@ -584,29 +594,30 @@ class DataAugmentationDINO(object):
 
         ref_pos_gc, ref_pos_otc = self.sampling_reference_point(gc_bboxes, otc_bboxes)
 
-        tea_pos = ref_pos_gc.chunk(2)   # (2, [1, 2+x, 2])
-        stu_pos = ref_pos_otc.chunk(ref_pos_otc.shape[0])   # (2+x, [1, 2, 2])
+        tea_pos = ref_pos_gc.chunk(2)   # (2, [1, 2+x, k*k, 2])
+        stu_pos = ref_pos_otc.chunk(ref_pos_otc.shape[0])   # (2+x, [1, 2, k*k, 2])
 
         # Adjust reference point coordinate according to flip
         for i in range(len(flip_record)):
             if flip_record[i]:
                 if i < 2:
-                    tea_pos[i][:,:,0] = -tea_pos[i][:,:,0]
-                    stu_pos[i][:,:,0] = -stu_pos[i][:,:,0]
+                    tea_pos[i][:,:,:,0] = -tea_pos[i][:,:,:,0]
+                    stu_pos[i][:,:,:,0] = -stu_pos[i][:,:,:,0]
                 else:
-                    stu_pos[i][:,:,0] = -stu_pos[i][:,:,0]          
+                    stu_pos[i][:,:,:,0] = -stu_pos[i][:,:,:,0]          
 
         tea_pos = list(map(lambda x: x.squeeze(0).detach(), tea_pos))
         stu_pos = list(map(lambda x: x.squeeze(0).detach(), stu_pos))
 
-        # --Important--
+        # --May not matter--
         # flip_record contains flip_flag, which is a tensor
         # Memory leak occurs without del
         del flip_record
         del gc_bboxes, otc_bboxes
 
         # multi_crops: List[2+x Tensor[3,H,W]]
-        # ref_pos_gc / ref_pos_otc: Tensor[2+x, 2] 
+        # tea_pos: List[2 Tensor[2+x,k*k,2]]
+        # stu_pos: List[2+x Tensor[2,k*k,2]]
         return multi_crops, tea_pos, stu_pos
 
     def calculate_bboxes(self, crop_bboxes):
@@ -647,21 +658,29 @@ class DataAugmentationDINO(object):
     
     def sampling_reference_point(self, gc_bboxes, otc_bboxes):
         # gc_bboxes: [2, 2+x, 4], otc_bboxes: [2+x, 2, 4]
-        ref_relate_pos = torch.rand((gc_bboxes.shape[0], gc_bboxes.shape[1], 2))    # [2, 2+x, 2]
+        if self.sampling_mode == 'random':
+            num_reference_point = self.num_reference * self.num_reference   # To align with "grid" mode
+            ref_relate_pos = torch.rand((gc_bboxes.shape[0], gc_bboxes.shape[1], num_reference_point, 2))    # [2, 2+x, k*k, 2]
+        elif self.sampling_mode == 'grid':
+            raise RuntimeError("Not implemented yet.")
+        else:
+            # sanity check
+            raise RuntimeError("Invalid sampling mode.")
 
-        ref_pos_x_gc = (gc_bboxes[:,:,2] - gc_bboxes[:,:,0]) * ref_relate_pos[:,:,0] + gc_bboxes[:,:,0]
-        ref_pos_y_gc = (gc_bboxes[:,:,3] - gc_bboxes[:,:,1]) * ref_relate_pos[:,:,1] + gc_bboxes[:,:,1]
-        ref_pos_gc = torch.stack((ref_pos_x_gc, ref_pos_y_gc), dim=-1)
+        ref_pos_x_gc = (gc_bboxes[:,:,None,2] - gc_bboxes[:,:,None,0]) * ref_relate_pos[:,:,:,0] + gc_bboxes[:,:,None,0]
+        ref_pos_y_gc = (gc_bboxes[:,:,None,3] - gc_bboxes[:,:,None,1]) * ref_relate_pos[:,:,:,1] + gc_bboxes[:,:,None,1]
+        ref_pos_gc = torch.stack((ref_pos_x_gc, ref_pos_y_gc), dim=-1)  # [2, 2+x, k*k, 2]
         ref_pos_gc = ref_pos_gc / self.size_crops[0] * 2. - 1.
 
-        ref_relate_pos = ref_relate_pos.permute(1,0,2)
-        ref_pos_x_all = (otc_bboxes[:,:,2] - otc_bboxes[:,:,0]) * ref_relate_pos[:,:,0] + otc_bboxes[:,:,0]
-        ref_pos_y_all = (otc_bboxes[:,:,3] - otc_bboxes[:,:,1]) * ref_relate_pos[:,:,1] + otc_bboxes[:,:,1]
+        ref_relate_pos = ref_relate_pos.permute(1,0,2,3)
+        ref_pos_x_all = (otc_bboxes[:,:,None,2] - otc_bboxes[:,:,None,0]) * ref_relate_pos[:,:,:,0] + otc_bboxes[:,:,None,0]
+        ref_pos_y_all = (otc_bboxes[:,:,None,3] - otc_bboxes[:,:,None,1]) * ref_relate_pos[:,:,:,1] + otc_bboxes[:,:,None,1]
         ref_pos_all = torch.stack((ref_pos_x_all, ref_pos_y_all), dim=-1)
         size_t = torch.cat((torch.tensor([self.size_crops[0], self.size_crops[0]]), torch.tensor([self.size_crops[1] for i in range(self.local_crops_number)])))
-        ref_pos_all = ref_pos_all / size_t[:,None,None] * 2. - 1.
+        ref_pos_all = ref_pos_all / size_t[:,None,None,None] * 2. - 1.
 
         # coordinate in x,y format
+        # ref_pos_gc: [2, 2+x, k*k, 2], ref_pos_all: [2+x, 2, k*k, 2]
         return ref_pos_gc, ref_pos_all
 
 def _upcast(t):

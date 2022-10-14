@@ -81,31 +81,51 @@ def get_args_parser():
 
 
 def vis_pos(x, pos, model, images, b_index, crop_index, target_index, name):
-    # Prepare token
+    # -- model.prepare_token --
     B, nc, w, h = x.shape
     x = model.patch_embed(x)  # patch linear embedding
-    num_cls_token = pos.shape[1]
-    cls_tokens = torch.zeros((B, num_cls_token, model.embed_dim)).cuda()
-    x = torch.cat((cls_tokens, x), dim=1)
+    
+    # add the [CLS] token to the embed patch tokens
+    if model.given_pos:
+        num_cls_token = pos.shape[1] * pos.shape[2] + 1
+        if model.with_cls_token:   
+            cls_tokens = model.cls_token.expand(1, num_cls_token, -1)
+        else:
+            cls_tokens = torch.zeros((1, num_cls_token - 1, model.embed_dim)).to(model.cls_token.device)
+            cls_tokens = torch.cat((model.cls_token, cls_tokens), dim=1)
+    else:
+        num_cls_token = 1
+        cls_tokens = model.cls_token
+    cls_tokens = cls_tokens.expand(B, -1, -1)
+    x = torch.cat((cls_tokens, x), dim=1)   # [B, 1+x+N, C]
+
     patch_pos = model.interpolate_pos_encoding(x, w, h, num_cls_token)
 
-    cls_pos_embed = model.interpolate_ref_point_pos_encoding(x, pos, patch_pos)
+    if model.given_pos:
+        cls_pos_embed = model.interpolate_ref_point_pos_encoding(x, pos, patch_pos)
+        pos_embed = torch.cat((model.cls_pos_embed.expand(B, -1, -1), cls_pos_embed, patch_pos.expand(B, -1, -1)), dim=1)
+    else:
+        pos_embed = torch.cat((model.cls_pos_embed, patch_pos), dim=1).expand(B, -1, -1)
 
-    # images: 2 * [B,C,H,W]
-    # x: [2B, ..., embed]
+    # -- dino loss --
+    cls_pos_embed = cls_pos_embed.unflatten(1, (2, cls_pos_embed.shape[1] // 2))
+    print("cls_pos_embed", cls_pos_embed.shape)
+
+    # images: 2 * [2B,C,H,W]
+    # x: [2B, 1+2*k+N, embed]
     # patch_pos: [1, 196, embed]
-    # cls_pos_embed: [2B, 2, embed]
+    # cls_pos_embed: [2B, 2, k, embed]
     
     actual_B = B // 2   # Attention: only fits when using crop 2, local crop
 
     patch_pos = patch_pos.squeeze(0)    # [196, embed]
-    cls_pos_embed = cls_pos_embed[crop_index * actual_B + b_index]    # [2, embed]
+    cls_pos_embed = cls_pos_embed[crop_index * actual_B + b_index][target_index]    # [k, embed]
     patch_pos = torch.nn.functional.normalize(patch_pos, p=2, dim=-1)
     cls_pos_embed = torch.nn.functional.normalize(cls_pos_embed, p=2, dim=-1)
 
     sim_mat = patch_pos @ cls_pos_embed.T
     sim_mat = sim_mat.reshape(int(math.sqrt(patch_pos.shape[0])), int(math.sqrt(patch_pos.shape[0])), -1)
-    print("sim_mat", sim_mat.shape)    # should be [14, 14, 2]
+    print("sim_mat", sim_mat.shape)    # should be [14, 14, k]
     vis_data = sim_mat.cpu().numpy()
 
     img = images[crop_index][b_index]    # [3, H, W]
@@ -117,16 +137,19 @@ def vis_pos(x, pos, model, images, b_index, crop_index, target_index, name):
     img = img.squeeze(0).permute(1,2,0).cpu().numpy()  # [H, W, 3]
     print(img.shape)
 
-    pos = pos[crop_index * actual_B + b_index][target_index]  # [2]
+    pos = pos[crop_index * actual_B + b_index][target_index]  # [k, 2]
     pos = pos.cpu().numpy()
 
     pos = (pos + 1.) / 2. * 224.
 
-    fig, ax = plt.subplots(1, 3,figsize=((3)*5, 5))
-    for j in range(3):
+    num_plots = pos.shape[-2] + 1
+    fig, ax = plt.subplots(1, num_plots,figsize=((num_plots)*5, 5))
+    color_list = ['red', 'blue', 'yellow', 'green']
+    for j in range(num_plots):
         if j == 0:
             ax[j].imshow(img)
-            ax[j].scatter(pos[0], pos[1], marker='o', c='red')
+            for k in range(pos.shape[-2]):
+                ax[j].scatter(pos[k][0], pos[k][1], marker='o', c=color_list[k])
         else:
             ax[j].imshow(vis_data[:,:,j-1], interpolation='nearest')
     
@@ -143,10 +166,14 @@ if __name__ == "__main__":
         help="Path to pretrained weights to load.")
     parser.add_argument("--checkpoint_key", default="teacher", type=str,
         help='Key to use in the checkpoint (example: "teacher")')
-    parser.add_argument('--num_cls_token', default=1, type=int, help="Number of cls_token")
-    parser.add_argument('--given_pos', action='store_true', help='Replace cls_pos_embed with patch_pos_embed.')
     parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
         help='Please specify path to the ImageNet training data.')
+
+    parser.add_argument('--given_pos', action='store_true', help='Replace cls_pos_embed with interpolated patch_pos_embed.')
+    parser.add_argument('--with_cls_token', action='store_true', help='Reference token shared learnable class token.')
+    parser.add_argument('--another_center', action='store_true', help='Use separate centering for given_pos_token.')
+    parser.add_argument('--num_reference', default=1, type=int, help="Number of points sampled per crop. Use k*k points in actual.")
+    parser.add_argument('--sampling_mode', type=str, choices=['random', 'grid'], help='Mode of reference point sampling.')
 
     parser.add_argument('--global_crops_scale', type=float, nargs='+', default=(0.4, 1.),
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
@@ -163,7 +190,7 @@ if __name__ == "__main__":
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     # build model
-    model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0, num_cls_token=args.num_cls_token)
+    model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0, given_pos=args.given_pos, with_cls_token=args.with_cls_token)
     for p in model.parameters():
         p.requires_grad = False
     model.eval()
@@ -205,6 +232,8 @@ if __name__ == "__main__":
             args.global_crops_scale,
             args.local_crops_scale,
             args.local_crops_number,
+            args.num_reference,
+            args.sampling_mode
         )
     dataset = datasets.ImageFolder(args.data_path, transform=transform)
     data_loader = torch.utils.data.DataLoader(
