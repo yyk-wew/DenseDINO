@@ -112,6 +112,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_cls_token', default=1, type=int, help="Number of cls_token")
     parser.add_argument('--given_pos', action='store_true', help='Replace cls_pos_embed with patch_pos_embed.')
     parser.add_argument('--with_cls_token', action='store_true', help='With learnable class token.')
+    parser.add_argument('--mask_mode', type=str, default='020', choices=['020', 'all2pos', 'all2pos_pos2cls'], help='Masked Attention.')
     parser.add_argument('--token_index', type=int, default=0, help='Token used for visualization.')
     parser.add_argument('--ref_coord', type=float, nargs='+', default=(0.0, 0.0), help='Coordinate of reference point, in (x,y) format.')
     args = parser.parse_args()
@@ -194,7 +195,7 @@ if __name__ == '__main__':
     h_featmap = img.shape[-1] // args.patch_size
 
     # attentions: [B, h, N, N], h: heads num, N: patch num. 
-    attentions = model.get_last_selfattention(img.to(device), pos.to(device) if pos is not None else None)
+    attentions = model.get_last_selfattention(img.to(device), pos=pos.to(device) if pos is not None else None, mask_mode=args.mask_mode)
 
     nh = attentions.shape[1] # number of head
     print("Attention shape", attentions.shape)
@@ -203,7 +204,7 @@ if __name__ == '__main__':
     attentions = attentions[0, :, args.token_index, -196:].reshape(nh, -1)
 
     # get output
-    output_tokens = model.get_intermediate_layers(img.to(device), pos.to(device) if pos is not None else None)[0][0]
+    output_tokens = model.get_intermediate_layers(img.to(device), pos=pos.to(device) if pos is not None else None, mask_mode=args.mask_mode)[0][0]
     output_tokens = torch.nn.functional.normalize(output_tokens, dim=-1, p=2)
     target_token = output_tokens[args.token_index]  # [1, D]
     patch_tokens = output_tokens[-196:]     # [196, D]

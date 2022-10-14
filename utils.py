@@ -617,7 +617,7 @@ class MultiCropWrapper(nn.Module):
         self.backbone = backbone
         self.head = head
 
-    def forward(self, x, pos=None):
+    def forward(self, x, pos=None, mask_mode=None):
         # convert to list
         if not isinstance(x, list):
             x = [x]
@@ -632,7 +632,7 @@ class MultiCropWrapper(nn.Module):
         )[1], 0)
         start_idx, output = 0, torch.empty(0).to(x[0].device)
         for end_idx in idx_crops:
-            _out = self.backbone(torch.cat(x[start_idx: end_idx]), torch.cat(pos[start_idx:end_idx] if pos is not None else None))
+            _out = self.backbone(torch.cat(x[start_idx: end_idx]), torch.cat(pos[start_idx:end_idx] if pos is not None else None), mask_mode=mask_mode)
             # The output is a tuple with XCiT model. See:
             # https://github.com/facebookresearch/xcit/blob/master/xcit.py#L404-L405
             if isinstance(_out, tuple):

@@ -72,6 +72,7 @@ def get_args_parser():
     parser.add_argument('--another_center', action='store_true', help='Use separate centering for given_pos_token.')
     parser.add_argument('--num_reference', default=1, type=int, help="Number of points sampled per crop. Use k*k points in actual.")
     parser.add_argument('--sampling_mode', type=str, default='random', choices=['random', 'grid'], help='Mode of reference point sampling.')
+    parser.add_argument('--mask_mode', type=str, default='020', choices=['020', 'all2pos', 'all2pos_pos2cls'], help='Masked Attention.')
 
     # Temperature teacher parameters
     parser.add_argument('--warmup_teacher_temp', default=0.04, type=float,
@@ -339,8 +340,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
 
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
-            teacher_output = teacher(images[:2], tea_pos)  # only the 2 global views pass through the teacher
-            student_output = student(images, stu_pos)
+            teacher_output = teacher(images[:2], tea_pos, args.mask_mode)  # only the 2 global views pass through the teacher
+            student_output = student(images, stu_pos, args.mask_mode)
             loss, global_loss, ref_loss = dino_loss(student_output, teacher_output, epoch, args.given_pos)
 
         if not math.isfinite(loss.item()):

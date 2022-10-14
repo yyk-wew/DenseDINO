@@ -77,12 +77,16 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x):
+    def forward(self, x, attn_mask=None):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
+        # -- Masked Attention for reference tokens --
+        if attn_mask is not None:
+            attn = attn + attn_mask
+        # -------------------------------------------
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
@@ -104,8 +108,8 @@ class Block(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-    def forward(self, x, return_attention=False):
-        y, attn = self.attn(self.norm1(x))
+    def forward(self, x, attn_mask=None, return_attention=False):
+        y, attn = self.attn(self.norm1(x), attn_mask=attn_mask)
         if return_attention:
             return attn
         x = x + self.drop_path(y)
@@ -216,7 +220,7 @@ class VisionTransformer(nn.Module):
 
         return cls_pos_embed        
 
-    def prepare_tokens(self, x, pos=None):
+    def prepare_tokens(self, x, pos=None, mask_mode=None):
         B, nc, w, h = x.shape
         x = self.patch_embed(x)  # patch linear embedding
 
@@ -247,12 +251,16 @@ class VisionTransformer(nn.Module):
         # add positional encoding to each token
         x = x + pos_embed
 
-        return self.pos_drop(x)
+        # prepare attn mask
+        attn_mask = self.prepare_attn_mask(x, num_cls_token, mask_mode)
 
-    def forward(self, x, pos=None):
-        x = self.prepare_tokens(x, pos)
+        return self.pos_drop(x), attn_mask
+
+    def forward(self, x, pos=None, mask_mode=None):
+        x, attn_mask = self.prepare_tokens(x, pos, mask_mode)
+
         for blk in self.blocks:
-            x = blk(x)
+            x = blk(x, attn_mask=attn_mask)
         x = self.norm(x)
 
         num_cls_token = pos.shape[1] * pos.shape[2] + 1 if self.given_pos else 1
@@ -265,21 +273,42 @@ class VisionTransformer(nn.Module):
         
         return x
 
-    def get_last_selfattention(self, x, pos=None):
-        x = self.prepare_tokens(x, pos)
+    def prepare_attn_mask(self, x, num_cls_token, mask_mode):
+        N = x.shape[1]
+
+        mask = torch.zeros((N, N)).to(x.device)
+
+        if mask_mode == '020':
+            return None
+        elif mask_mode == 'all2pos':
+            mask[:, 1:num_cls_token] = -float('inf')
+        elif mask_mode == 'all2pos_pos2cls':
+            mask[:, 1:num_cls_token] = -float('inf')
+            mask[1:num_cls_token, 0] = -float('inf')
+        elif mask_mode is None:
+            return None
+        else:
+            print("Warning: Invalid mask mode: ", mask_mode)
+            return None
+        
+        return mask.detach()
+      
+
+    def get_last_selfattention(self, x, pos=None, mask_mode=None):
+        x, attn_mask = self.prepare_tokens(x, pos, mask_mode)
         for i, blk in enumerate(self.blocks):
             if i < len(self.blocks) - 1:
-                x = blk(x)
+                x = blk(x, attn_mask=attn_mask)
             else:
                 # return attention of the last block
                 return blk(x, return_attention=True)
 
-    def get_intermediate_layers(self, x, pos=None, n=1):
-        x = self.prepare_tokens(x, pos)
+    def get_intermediate_layers(self, x, pos=None, mask_mode=None, n=1):
+        x, attn_mask = self.prepare_tokens(x, pos, mask_mode)
         # we return the output tokens from the `n` last blocks
         output = []
         for i, blk in enumerate(self.blocks):
-            x = blk(x)
+            x = blk(x, attn_mask=attn_mask)
             if len(self.blocks) - i <= n:
                 output.append(self.norm(x))
         return output
