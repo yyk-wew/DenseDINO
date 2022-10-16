@@ -285,6 +285,10 @@ class VisionTransformer(nn.Module):
         elif mask_mode == 'all2pos_pos2cls':
             mask[:, 1:num_cls_token] = -float('inf')
             mask[1:num_cls_token, 0] = -float('inf')
+        elif mask_mode == 'all2pos_pos2cls_eye':
+            mask[:, 1:num_cls_token] = -float('inf')
+            mask[1:num_cls_token, 0] = -float('inf')
+            mask = mask.fill_diagonal_(0.)
         elif mask_mode is None:
             return None
         else:
