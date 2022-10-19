@@ -68,7 +68,7 @@ def get_args_parser():
         help="Whether to use batch normalizations in projection head (Default: False)")
     
     parser.add_argument('--given_pos', action='store_true', help='Replace cls_pos_embed with interpolated patch_pos_embed.')
-    parser.add_argument('--with_cls_token', action='store_true', help='Reference token shared learnable class token.')
+    parser.add_argument('--with_learnable_token', action='store_true', help='Reference token with learnable class token.')
     parser.add_argument('--another_center', action='store_true', help='Use separate centering for given_pos_token.')
     parser.add_argument('--num_reference', default=1, type=int, help="Number of points sampled per crop. Use k*k points in actual.")
     parser.add_argument('--sampling_mode', type=str, default='random', choices=['random', 'grid'], help='Mode of reference point sampling.')
@@ -178,9 +178,9 @@ def train_dino(args):
             patch_size=args.patch_size,
             drop_path_rate=args.drop_path_rate,  # stochastic depth
             given_pos=args.given_pos,
-            with_cls_token=args.with_cls_token
+            with_learnable_token=args.with_learnable_token
         )
-        teacher = vits.__dict__[args.arch](patch_size=args.patch_size, given_pos=args.given_pos, with_cls_token=args.with_cls_token)
+        teacher = vits.__dict__[args.arch](patch_size=args.patch_size, given_pos=args.given_pos, with_learnable_token=args.with_learnable_token)
         embed_dim = student.embed_dim
     # if the network is a XCiT
     elif args.arch in torch.hub.list("facebookresearch/xcit:main"):

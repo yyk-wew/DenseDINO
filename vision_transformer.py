@@ -139,17 +139,20 @@ class VisionTransformer(nn.Module):
     """ Vision Transformer """
     def __init__(self, img_size=[224], patch_size=16, in_chans=3, num_classes=0, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., norm_layer=nn.LayerNorm, given_pos=False, with_cls_token=True, **kwargs):
+                 drop_path_rate=0., norm_layer=nn.LayerNorm, given_pos=False, with_learnable_token=False, **kwargs):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
         self.given_pos = given_pos
-        self.with_cls_token = with_cls_token
+        self.with_learnable_token = with_learnable_token
 
         self.patch_embed = PatchEmbed(
             img_size=img_size[0], patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        if self.with_learnable_token:
+            self.ref_learn_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+            trunc_normal_(self.cls_token, std=.02)
         
         self.patch_pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
         self.cls_pos_embed = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -227,11 +230,11 @@ class VisionTransformer(nn.Module):
         # add the [CLS] token to the embed patch tokens
         if self.given_pos:
             num_cls_token = pos.shape[1] * pos.shape[2] + 1
-            if self.with_cls_token:   
-                cls_tokens = self.cls_token.expand(1, num_cls_token, -1)
+            if self.with_learnable_token:   
+                cls_tokens = self.ref_learn_token.expand(1, num_cls_token - 1, -1)
             else:
                 cls_tokens = torch.zeros((1, num_cls_token - 1, self.embed_dim)).to(self.cls_token.device)
-                cls_tokens = torch.cat((self.cls_token, cls_tokens), dim=1)
+            cls_tokens = torch.cat((self.cls_token, cls_tokens), dim=1)
         else:
             num_cls_token = 1
             cls_tokens = self.cls_token
