@@ -112,7 +112,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_cls_token', default=1, type=int, help="Number of cls_token")
     parser.add_argument('--given_pos', action='store_true', help='Replace cls_pos_embed with patch_pos_embed.')
     parser.add_argument('--with_cls_token', action='store_true', help='With learnable class token.')
-    parser.add_argument('--mask_mode', type=str, default='020', choices=['020', 'all2pos', 'all2pos_pos2cls'], help='Masked Attention.')
+    parser.add_argument('--mask_mode', type=str, default='020', choices=['020', 'all2pos', 'all2pos_pos2cls', 'all2pos_pos2cls_eye'], help='Masked Attention.')
     parser.add_argument('--token_index', type=int, default=0, help='Token used for visualization.')
     parser.add_argument('--ref_coord', type=float, nargs='+', default=(0.0, 0.0), help='Coordinate of reference point, in (x,y) format.')
     args = parser.parse_args()

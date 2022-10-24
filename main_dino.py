@@ -69,6 +69,7 @@ def get_args_parser():
     
     parser.add_argument('--given_pos', action='store_true', help='Replace cls_pos_embed with interpolated patch_pos_embed.')
     parser.add_argument('--with_learnable_token', action='store_true', help='Reference token with learnable class token.')
+    parser.add_argument('--remove_global_token', action='store_true', help='Whether to remove the global class token.')
     parser.add_argument('--another_center', action='store_true', help='Use separate centering for given_pos_token.')
     parser.add_argument('--num_reference', default=1, type=int, help="Number of points sampled per crop. Use k*k points in actual.")
     parser.add_argument('--sampling_mode', type=str, default='random', choices=['random', 'grid'], help='Mode of reference point sampling.')
@@ -178,9 +179,15 @@ def train_dino(args):
             patch_size=args.patch_size,
             drop_path_rate=args.drop_path_rate,  # stochastic depth
             given_pos=args.given_pos,
-            with_learnable_token=args.with_learnable_token
+            with_learnable_token=args.with_learnable_token,
+            remove_global_token=args.remove_global_token
         )
-        teacher = vits.__dict__[args.arch](patch_size=args.patch_size, given_pos=args.given_pos, with_learnable_token=args.with_learnable_token)
+        teacher = vits.__dict__[args.arch](
+            patch_size=args.patch_size, 
+            given_pos=args.given_pos, 
+            with_learnable_token=args.with_learnable_token,
+            remove_global_token=args.remove_global_token
+        )
         embed_dim = student.embed_dim
     # if the network is a XCiT
     elif args.arch in torch.hub.list("facebookresearch/xcit:main"):
@@ -236,7 +243,8 @@ def train_dino(args):
         args.teacher_temp,
         args.warmup_teacher_temp_epochs,
         args.epochs,
-        args.another_center
+        remove_global=args.remove_global_token,
+        another_center=args.another_center,
     ).cuda()
 
     # ============ preparing optimizer ... ============
@@ -376,7 +384,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
 
         # logging
         torch.cuda.synchronize()
-        metric_logger.update(loss=loss.item(), global_loss=global_loss.item(), ref_loss=ref_loss.item())
+        metric_logger.update(loss=loss, global_loss=global_loss, ref_loss=ref_loss)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
     # gather the stats from all processes
@@ -387,13 +395,16 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
 
 class DINOLoss(nn.Module):
     def __init__(self, out_dim, ncrops, warmup_teacher_temp, teacher_temp,
-                 warmup_teacher_temp_epochs, nepochs, another_center=False, student_temp=0.1,
+                 warmup_teacher_temp_epochs, nepochs, remove_global=False, another_center=False, student_temp=0.1,
                  center_momentum=0.9):
         super().__init__()
         self.student_temp = student_temp
         self.center_momentum = center_momentum
         self.ncrops = ncrops
-        self.register_buffer("center", torch.zeros(1, out_dim))
+        self.remove_global = remove_global
+        self.num_cls_token = 0 if remove_global else 1
+        if not remove_global:
+            self.register_buffer("center", torch.zeros(1, out_dim))
         self.another_center = another_center
         if another_center:
             self.register_buffer("ref_center", torch.zeros(1, out_dim))
@@ -413,16 +424,18 @@ class DINOLoss(nn.Module):
             num_ref_point = student_output.shape[1] // 2
 
         student_out = student_output / self.student_temp
-        student_out_global = student_out[:,0].chunk(self.ncrops) # [2+x, [B, dim]]
+        if not self.remove_global:
+            student_out_global = student_out[:,0].chunk(self.ncrops) # [2+x, [B, dim]]
         if given_pos:
-            student_out_ref = student_out[:,1:].unflatten(1, (2,num_ref_point)).chunk(self.ncrops)   # [2+x, [B, 2, k, dim]]
+            student_out_ref = student_out[:,self.num_cls_token:].unflatten(1, (2,num_ref_point)).chunk(self.ncrops)   # [2+x, [B, 2, k, dim]]
 
         # teacher centering and sharpening
         temp = self.teacher_temp_schedule[epoch]
         # teacher_out = F.softmax((teacher_output - self.center) / temp, dim=-1)
-        teacher_out_global = F.softmax((teacher_output[:,0] - self.center) / temp, dim=-1).detach().chunk(2)  # [2, [B, dim]]
+        if not self.remove_global:
+            teacher_out_global = F.softmax((teacher_output[:,0] - self.center) / temp, dim=-1).detach().chunk(2)  # [2, [B, dim]]
         if given_pos:
-            teacher_out_ref_temp = teacher_output[:,1:].unflatten(1, (self.ncrops,num_ref_point))  # [2B, 2+x, k, dim]
+            teacher_out_ref_temp = teacher_output[:,self.num_cls_token:].unflatten(1, (self.ncrops,num_ref_point))  # [2B, 2+x, k, dim]
             if self.another_center:
                 teacher_out_ref_temp = F.softmax((teacher_out_ref_temp - self.ref_center) / temp, dim=-1)
             else:
@@ -430,7 +443,7 @@ class DINOLoss(nn.Module):
             teacher_out_ref = teacher_out_ref_temp.detach().chunk(2) # [2, [B, 2+x, k, dim]]
 
         global_loss, ref_loss = 0, 0
-        global_n_loss_terms, ref_n_loss_terms = 0, 0
+        global_n_loss_terms, ref_n_loss_terms = 1e-5, 1e-5  # prevent zero division
 
         for iq in range(2): # 2 == len(teacher_out_global)
             for v in range(self.ncrops):    # self.ncrops == len(student_out_global)
@@ -438,9 +451,10 @@ class DINOLoss(nn.Module):
                     # we skip cases where student and teacher operate on the same view
                     continue
                 # global cls token loss
-                loss = torch.sum(-teacher_out_global[iq] * F.log_softmax(student_out_global[v], dim=-1), dim=-1)
-                global_loss += loss.mean()
-                global_n_loss_terms += 1
+                if not self.remove_global:
+                    loss = torch.sum(-teacher_out_global[iq] * F.log_softmax(student_out_global[v], dim=-1), dim=-1)
+                    global_loss += loss.mean()
+                    global_n_loss_terms += 1
                 
                 # given position token loss
                 if given_pos:
@@ -449,7 +463,16 @@ class DINOLoss(nn.Module):
                     ref_n_loss_terms += 1
         global_loss /= global_n_loss_terms
         ref_loss /= ref_n_loss_terms
-        total_loss = 0.5 * global_loss + 0.5 * ref_loss
+
+        if given_pos and not self.remove_global:
+            total_loss = 0.5 * global_loss + 0.5 * ref_loss
+        elif given_pos and self.remove_global:
+            total_loss = ref_loss
+        elif not given_pos and not self.remove_global:
+            total_loss = global_loss
+        else:
+            print("Invalid param.")
+            sys.exit(0)
 
         self.update_center(teacher_output)
         return total_loss, global_loss, ref_loss
@@ -466,9 +489,10 @@ class DINOLoss(nn.Module):
         # batch_center: [1, 1+(2+x)*k, D]
 
         # ema update
-        self.center = self.center * self.center_momentum + batch_center[:, 0] * (1 - self.center_momentum)
+        if not self.remove_global:
+            self.center = self.center * self.center_momentum + batch_center[:, 0] * (1 - self.center_momentum)
         if self.another_center:
-            self.ref_center = self.ref_center * self.center_momentum + batch_center[:, 1:].mean(dim=1, keepdim=False) * (1 - self.center_momentum)
+            self.ref_center = self.ref_center * self.center_momentum + batch_center[:, self.num_cls_token:].mean(dim=1, keepdim=False) * (1 - self.center_momentum)
 
 
 class DataAugmentationDINO(object):

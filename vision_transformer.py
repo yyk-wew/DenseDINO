@@ -139,24 +139,30 @@ class VisionTransformer(nn.Module):
     """ Vision Transformer """
     def __init__(self, img_size=[224], patch_size=16, in_chans=3, num_classes=0, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., norm_layer=nn.LayerNorm, given_pos=False, with_learnable_token=False, **kwargs):
+                 drop_path_rate=0., norm_layer=nn.LayerNorm, given_pos=False, with_learnable_token=False,
+                 remove_global_token=False, **kwargs):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
         self.given_pos = given_pos
         self.with_learnable_token = with_learnable_token
+        self.remove_global_token = remove_global_token
 
         self.patch_embed = PatchEmbed(
             img_size=img_size[0], patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
 
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        if not self.remove_global_token:
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+            self.cls_pos_embed = nn.Parameter(torch.zeros(1, 1, embed_dim))
+            trunc_normal_(self.cls_token, std=.02)
+            trunc_normal_(self.cls_pos_embed, std=.02)
         if self.with_learnable_token:
             self.ref_learn_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-            trunc_normal_(self.cls_token, std=.02)
+            trunc_normal_(self.ref_learn_token, std=.02)
         
         self.patch_pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
-        self.cls_pos_embed = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
+        trunc_normal_(self.patch_pos_embed, std=.02)
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         self.blocks = nn.ModuleList([
@@ -169,9 +175,6 @@ class VisionTransformer(nn.Module):
         # Classifier head
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-        trunc_normal_(self.patch_pos_embed, std=.02)
-        trunc_normal_(self.cls_pos_embed, std=.02)
-        trunc_normal_(self.cls_token, std=.02)
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -183,8 +186,8 @@ class VisionTransformer(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def interpolate_pos_encoding(self, x, w, h, num_cls_token):
-        npatch = x.shape[1] - num_cls_token
+    def interpolate_pos_encoding(self, x, w, h):
+        npatch = x.shape[1]
         N = self.patch_pos_embed.shape[1]
         if npatch == N and w == h:
             return self.patch_pos_embed
@@ -203,59 +206,66 @@ class VisionTransformer(nn.Module):
         )
         assert int(w0) == patch_pos_embed.shape[-2] and int(h0) == patch_pos_embed.shape[-1]
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
-        # return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1)
         return patch_pos_embed
 
-    def interpolate_ref_point_pos_encoding(self, x, pos, patch_pos_embed):
+    def interpolate_ref_point_pos_encoding(self, pos, patch_pos_embed):
         # patch_pos_embed: [1, N, embed]
         # pos: [B, x, k, 2]
         # return: [B, x, k, embed]
 
         N = patch_pos_embed.shape[1]
         dim = patch_pos_embed.shape[-1]
-        B = x.shape[0]
+        B = pos.shape[0]
         
         patch_pos_embed = patch_pos_embed.reshape(1, int(math.sqrt(N)), int(math.sqrt(N)), dim).permute(0, 3, 1, 2).expand(B, -1, -1, -1)
         # patch_pos_embed: [B, embed, H, W]
 
-        cls_pos_embed = nn.functional.grid_sample(input=patch_pos_embed, grid=pos, mode='bicubic')  # [B, embed, x, k]
-        cls_pos_embed = cls_pos_embed.flatten(2,3).permute(0, 2, 1)   # [B, x*k, embed]
+        ref_pos_embed = nn.functional.grid_sample(input=patch_pos_embed, grid=pos, mode='bicubic')  # [B, embed, x, k]
+        ref_pos_embed = ref_pos_embed.flatten(2,3).permute(0, 2, 1)   # [B, x*k, embed]
 
-        return cls_pos_embed        
+        return ref_pos_embed        
 
     def prepare_tokens(self, x, pos=None, mask_mode=None):
         B, nc, w, h = x.shape
-        x = self.patch_embed(x)  # patch linear embedding
-
-        # add the [CLS] token to the embed patch tokens
-        if self.given_pos:
-            num_cls_token = pos.shape[1] * pos.shape[2] + 1
-            if self.with_learnable_token:   
-                cls_tokens = self.ref_learn_token.expand(1, num_cls_token - 1, -1)
-            else:
-                cls_tokens = torch.zeros((1, num_cls_token - 1, self.embed_dim)).to(self.cls_token.device)
-            cls_tokens = torch.cat((self.cls_token, cls_tokens), dim=1)
-        else:
-            num_cls_token = 1
-            cls_tokens = self.cls_token
-        cls_tokens = cls_tokens.expand(B, -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)   # [B, 1+x+N, C]
+        x = self.patch_embed(x)  # patch linear embedding: [B, N, D]
 
         # interpolate patch positional encoding
-        patch_pos = self.interpolate_pos_encoding(x, w, h, num_cls_token)
+        patch_pos = self.interpolate_pos_encoding(x, w, h)  # [1, N, D]
+
+        # add the [REF] token to the embed patch tokens
+        num_ref_token = 0
+        if self.given_pos:
+            num_ref_token = pos.shape[1] * pos.shape[2]
+            if self.with_learnable_token:   
+                ref_tokens = self.ref_learn_token.expand(1, num_ref_token, -1)
+            else:
+                ref_tokens = torch.zeros((1, num_ref_token, self.embed_dim)).to(x.device)
+
+            ref_tokens = ref_tokens.expand(B, -1, -1)
+            x = torch.cat((ref_tokens, x), dim=1)   # [B, x+N, D]
+
+        # add the [CLS] token to the embed patch tokens
+        num_cls_token = 0
+        if not self.remove_global_token:
+            num_cls_token = 1
+            cls_tokens = self.cls_token.expand(B, -1, -1)
+            x = torch.cat((cls_tokens, x), dim=1)   # [B, 1+x+N, D]
+        
+        pos_embed = patch_pos.expand(B, -1, -1)
+        # add REF positional encoding
+        if self.given_pos:
+            ref_pos_embed = self.interpolate_ref_point_pos_encoding(pos, patch_pos) # [B, x, D]
+            pos_embed = torch.cat((ref_pos_embed, pos_embed), dim=1)
         
         # add CLS positional encoding
-        if self.given_pos:
-            cls_pos_embed = self.interpolate_ref_point_pos_encoding(x, pos, patch_pos)
-            pos_embed = torch.cat((self.cls_pos_embed.expand(B, -1, -1), cls_pos_embed, patch_pos.expand(B, -1, -1)), dim=1)
-        else:
-            pos_embed = torch.cat((self.cls_pos_embed, patch_pos), dim=1).expand(B, -1, -1)
+        if not self.remove_global_token:
+            pos_embed = torch.cat((self.cls_pos_embed.expand(B, -1, -1), pos_embed), dim=1)
 
         # add positional encoding to each token
         x = x + pos_embed
 
         # prepare attn mask
-        attn_mask = self.prepare_attn_mask(x, num_cls_token, mask_mode)
+        attn_mask = self.prepare_attn_mask(x, mask_mode, num_cls_token, num_ref_token)
 
         return self.pos_drop(x), attn_mask
 
@@ -266,8 +276,9 @@ class VisionTransformer(nn.Module):
             x = blk(x, attn_mask=attn_mask)
         x = self.norm(x)
 
-        num_cls_token = pos.shape[1] * pos.shape[2] + 1 if self.given_pos else 1
-        x = x[:, :num_cls_token]
+        num_other_token = 0 if self.remove_global_token else 1
+        num_other_token = num_other_token + pos.shape[1] * pos.shape[2] if self.given_pos else num_other_token
+        x = x[:, :num_other_token]
 
         if self.training:
             pass
@@ -276,7 +287,7 @@ class VisionTransformer(nn.Module):
         
         return x
 
-    def prepare_attn_mask(self, x, num_cls_token, mask_mode):
+    def prepare_attn_mask(self, x, mask_mode, num_cls_token=0, num_ref_token=0):
         N = x.shape[1]
 
         mask = torch.zeros((N, N)).to(x.device)
@@ -284,13 +295,13 @@ class VisionTransformer(nn.Module):
         if mask_mode == '020':
             return None
         elif mask_mode == 'all2pos':
-            mask[:, 1:num_cls_token] = -float('inf')
+            mask[:, num_cls_token:num_cls_token+num_ref_token] = -float('inf')
         elif mask_mode == 'all2pos_pos2cls':
-            mask[:, 1:num_cls_token] = -float('inf')
-            mask[1:num_cls_token, 0] = -float('inf')
+            mask[:, num_cls_token:num_cls_token+num_ref_token] = -float('inf')
+            mask[num_cls_token:num_cls_token+num_ref_token, 0] = -float('inf')
         elif mask_mode == 'all2pos_pos2cls_eye':
-            mask[:, 1:num_cls_token] = -float('inf')
-            mask[1:num_cls_token, 0] = -float('inf')
+            mask[:, num_cls_token:num_cls_token+num_ref_token] = -float('inf')
+            mask[num_cls_token:num_cls_token+num_ref_token, 0] = -float('inf')
             mask = mask.fill_diagonal_(0.)
         elif mask_mode is None:
             return None
