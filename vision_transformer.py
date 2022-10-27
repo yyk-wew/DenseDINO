@@ -331,6 +331,19 @@ class VisionTransformer(nn.Module):
                 output.append(self.norm(x))
         return output
 
+    def get_patch_tokens(self, x, pos=None, mask_mode=None):
+        x, attn_mask = self.prepare_tokens(x, pos, mask_mode)
+
+        for blk in self.blocks:
+            x = blk(x, attn_mask=attn_mask)
+        x = self.norm(x)
+
+        num_other_token = 0 if self.remove_global_token else 1
+        num_other_token = num_other_token + pos.shape[1] * pos.shape[2] if pos is not None else num_other_token
+        x = x[:, num_other_token:]  
+        
+        return x
+
 
 def vit_tiny(patch_size=16, **kwargs):
     model = VisionTransformer(

@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import VisionDataset
 from typing import Tuple, Any
 import os
+import sys
 
 from torchmetrics import Metric
 import torch
@@ -105,6 +106,14 @@ class VOCDataset(VisionDataset):
 
         self.images = [os.path.join(image_dir, x + ".jpg") for x in file_names]
         self.masks = [os.path.join(seg_dir, x + ".png") for x in file_names]
+
+        # dummy implementation (Should combine SegmentationClass and SegmentationClassAug)
+        for i in range(len(self.masks)):
+            if not Path(self.masks[i]).is_file():
+                self.masks[i] = os.path.join(root, "SegmentationClass", os.path.split(self.masks[i])[1])
+
+        # print(split_f, self.image_set, len(self.masks), len(self.images))
+
         self.return_masks = return_masks
 
         assert all([Path(f).is_file() for f in self.masks]) and all([Path(f).is_file() for f in self.images])
@@ -289,13 +298,13 @@ class StreamSegMetrics(object):
         )
 
         return {
-            "Total samples": self.total_samples,
-            "Overall Acc": acc,
-            "Mean Acc": acc_cls,
-            "FreqW Acc": fwavacc,
+            # "Total samples": self.total_samples,
+            # "Overall Acc": acc,
+            # "Mean Acc": acc_cls,
+            # "FreqW Acc": fwavacc,
             "Mean IoU": mean_iu,
-            "Class IoU": cls_iu,
-            "Class Acc": cls_acc,
+            # "Class IoU": cls_iu,
+            # "Class Acc": cls_acc,
             # "Confusion Matrix": self.confusion_matrix_to_fig()
         }
 

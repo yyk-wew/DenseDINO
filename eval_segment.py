@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+from random import shuffle
 import sys
 import argparse
 import json
@@ -30,6 +31,7 @@ import utils
 import vision_transformer as vits
 
 from segment_utils import VOCDataset, PredsmIoU, StreamSegMetrics
+from segment_utils import Compose, RandomHorizontalFlip, RandomResizedCrop, ToTensor, Normalize
 from tqdm import tqdm
 
 
@@ -42,7 +44,7 @@ def eval_linear(args):
     # ============ building network ... ============
     # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
     if args.arch in vits.__dict__.keys():
-        model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0)
+        model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0, with_learnable_token=args.with_learnable_token, remove_global_token=args.remove_global_token)
         embed_dim = model.embed_dim
     # if the network is a XCiT
     elif "xcit" in args.arch:
@@ -82,12 +84,12 @@ def eval_linear(args):
 
     # ============ preparing data ... ============
     val_image_transform = pth_transforms.Compose([
-        pth_transforms.Resize((448, 448)),
+        pth_transforms.Resize((args.input_size, args.input_size)),
         pth_transforms.ToTensor(),
         pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
     val_target_transform = pth_transforms.Compose([
-        pth_transforms.Resize((448, 448), interpolation=InterpolationMode.NEAREST),
+        pth_transforms.Resize((args.input_size, args.input_size), interpolation=InterpolationMode.NEAREST),
         pth_transforms.ToTensor(),
     ])
     dataset_val = VOCDataset(root=args.data_path, image_set='val', transform=val_image_transform, target_transform=val_target_transform)
@@ -110,119 +112,119 @@ def eval_linear(args):
             state_dict = torch.load(args.pretrained_head)['state_dict']
         msg = seg_head.load_state_dict(state_dict, strict=True)
         print('Pretrained head found at {} and loaded with msg: {}'.format(args.pretrained_head, msg))
-        spatial_size = 448 // args.patch_size
-        test_stats = validate_network(val_loader, model, seg_head, args.num_classes, spatial_size, args.eval_size)
-        print(f"Accuracy of the network on the {len(dataset_val)} val images: {test_stats['Mean IoU']:.3f}%")
+        test_stats = validate_network(val_loader, model, seg_head, args.num_classes, args.spatial_size, args.eval_size)
+        print(f"Accuracy of the network on the {len(dataset_val)} val images: {test_stats['Mean IoU']:.3f}")
         return
 
-    # train_transform = pth_transforms.Compose([
-    #     pth_transforms.RandomResizedCrop(224),
-    #     pth_transforms.RandomHorizontalFlip(),
-    #     pth_transforms.ToTensor(),
-    #     pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-    # ])
-    # dataset_train = datasets.ImageFolder(os.path.join(args.data_path, "train"), transform=train_transform)
-    # sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
-    # train_loader = torch.utils.data.DataLoader(
-    #     dataset_train,
-    #     sampler=sampler,
-    #     batch_size=args.batch_size_per_gpu,
-    #     num_workers=args.num_workers,
-    #     pin_memory=True,
-    # )
-    # print(f"Data loaded with {len(dataset_train)} train and {len(dataset_val)} val imgs.")
+    train_transform = Compose([
+        RandomResizedCrop(size=args.input_size, scale=(0.8, 1.)),
+        RandomHorizontalFlip(p=0.5),
+        ToTensor(),
+        Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
+    dataset_train = VOCDataset(root=args.data_path, image_set='trainaug', transforms=train_transform, return_masks=True)
+    sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
+    train_loader = torch.utils.data.DataLoader(
+        dataset_train,
+        sampler=sampler,
+        batch_size=args.batch_size_per_gpu,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+    print(f"Data loaded with {len(dataset_train)} train and {len(dataset_val)} val imgs.")
 
-    # # set optimizer
-    # optimizer = torch.optim.SGD(
-    #     linear_classifier.parameters(),
-    #     args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 256., # linear scaling rule
-    #     momentum=0.9,
-    #     weight_decay=0, # we do not apply weight decay
-    # )
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs, eta_min=0)
+    # set optimizer
+    optimizer = torch.optim.SGD(
+        seg_head.parameters(),
+        args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 60., # linear scaling rule
+        momentum=0.9,
+        weight_decay=0.0001, # we do not apply weight decay
+    )
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20)    # decay rate default: 0.1
 
-    # # Optionally resume from a checkpoint
-    # to_restore = {"epoch": 0, "best_acc": 0.}
-    # utils.restart_from_checkpoint(
-    #     os.path.join(args.output_dir, "checkpoint.pth.tar"),
-    #     run_variables=to_restore,
-    #     state_dict=linear_classifier,
-    #     optimizer=optimizer,
-    #     scheduler=scheduler,
-    # )
-    # start_epoch = to_restore["epoch"]
-    # best_acc = to_restore["best_acc"]
+    # Optionally resume from a checkpoint
+    to_restore = {"epoch": 0, "best_miou": 0.}
+    utils.restart_from_checkpoint(
+        os.path.join(args.output_dir, "checkpoint.pth.tar"),
+        run_variables=to_restore,
+        state_dict=seg_head,
+        optimizer=optimizer,
+        scheduler=scheduler,
+    )
+    start_epoch = to_restore["epoch"]
+    best_miou = to_restore["best_miou"]
 
-    # for epoch in range(start_epoch, args.epochs):
-    #     train_loader.sampler.set_epoch(epoch)
+    for epoch in range(start_epoch, args.epochs):
+        train_loader.sampler.set_epoch(epoch)
 
-    #     train_stats = train(model, linear_classifier, optimizer, train_loader, epoch, args.n_last_blocks, args.avgpool_patchtokens)
-    #     scheduler.step()
+        train_stats = train(model, seg_head, optimizer, train_loader, epoch, args.spatial_size, args.train_mask_size, args.input_size)
+        scheduler.step()
 
-    #     log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-    #                  'epoch': epoch}
-    #     if epoch % args.val_freq == 0 or epoch == args.epochs - 1:
-    #         test_stats = validate_network(val_loader, model, linear_classifier, args.n_last_blocks, args.avgpool_patchtokens)
-    #         print(f"Accuracy at epoch {epoch} of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-    #         best_acc = max(best_acc, test_stats["acc1"])
-    #         print(f'Max accuracy so far: {best_acc:.2f}%')
-    #         log_stats = {**{k: v for k, v in log_stats.items()},
-    #                      **{f'test_{k}': v for k, v in test_stats.items()}}
-    #     if utils.is_main_process():
-    #         with (Path(args.output_dir) / "log.txt").open("a") as f:
-    #             f.write(json.dumps(log_stats) + "\n")
-    #         save_dict = {
-    #             "epoch": epoch + 1,
-    #             "state_dict": linear_classifier.state_dict(),
-    #             "optimizer": optimizer.state_dict(),
-    #             "scheduler": scheduler.state_dict(),
-    #             "best_acc": best_acc,
-    #         }
-    #         torch.save(save_dict, os.path.join(args.output_dir, "checkpoint.pth.tar"))
-    # print("Training of the supervised linear classifier on frozen features completed.\n"
-    #             "Top-1 test accuracy: {acc:.1f}".format(acc=best_acc))
+        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                     'epoch': epoch}
+        if epoch % args.val_freq == 0 or epoch == args.epochs - 1:
+            test_stats = validate_network(val_loader, model, seg_head, args.num_classes, args.spatial_size, args.eval_size)
+            print(f"Accuracy at epoch {epoch} of the network on the {len(dataset_val)} test images: {test_stats['Mean IoU']:.3f}")
+            best_miou = max(best_miou, test_stats['Mean IoU'])
+            print(f'Max MIoU so far: {best_miou:.3f}')
+            log_stats = {**{k: v for k, v in log_stats.items()},
+                         **{f'test_{k}': v for k, v in test_stats.items()}}
+        if utils.is_main_process():
+            with (Path(args.output_dir) / "log.txt").open("a") as f:
+                f.write(json.dumps(log_stats) + "\n")
+            save_dict = {
+                "epoch": epoch + 1,
+                "state_dict": seg_head.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "best_miou": best_miou,
+            }
+            torch.save(save_dict, os.path.join(args.output_dir, "checkpoint.pth.tar"))
+    print("Training of the supervised linear classifier on frozen features completed.\n"
+                "Top-1 test miou: {miou:.3f}".format(miou=best_miou))
 
 
-# def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
-#     linear_classifier.train()
-#     # metric_logger = 
-#     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-#     header = 'Epoch: [{}]'.format(epoch)
-#     for (inp, target) in metric_logger.log_every(loader, 20, header):
-#         # move to gpu
-#         inp = inp.cuda(non_blocking=True)
-#         target = target.cuda(non_blocking=True)
+def train(model, seg_head, optimizer, loader, epoch, spatial_size, train_mask_size, input_size, ignore_index=255):
+    seg_head.train()
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    header = 'Epoch: [{}]'.format(epoch)
+    for (inp, target) in metric_logger.log_every(loader, 5, header):
+        # move to gpu
+        inp = inp.cuda(non_blocking=True)
+        target = target.cuda(non_blocking=True)
+        B = inp.shape[0]
 
-#         # forward
-#         with torch.no_grad():
-#             if "vit" in args.arch:
-#                 intermediate_output = model.get_intermediate_layers(inp, n)
-#                 output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
-#                 if avgpool:
-#                     output = torch.cat((output.unsqueeze(-1), torch.mean(intermediate_output[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
-#                     output = output.reshape(output.shape[0], -1)
-#             else:
-#                 output = model(inp)
-#         output = linear_classifier(output)
+        # forward
+        with torch.no_grad():
+            output = model.get_patch_tokens(inp).reshape(B, spatial_size, spatial_size, model.embed_dim).permute(0, 3, 1, 2)
+            output = nn.functional.interpolate(output, size=(train_mask_size, train_mask_size), mode='bilinear')
+        
+        preds = seg_head(output)
+        
+        mask = target * 255
+        if train_mask_size != input_size:
+            with torch.no_grad():
+                mask = nn.functional.interpolate(mask, size=(train_mask_size, train_mask_size), mode='nearest')
+            
+        # compute cross entropy loss
+        loss = nn.CrossEntropyLoss(ignore_index=ignore_index)(preds, mask.long().squeeze())
 
-#         # compute cross entropy loss
-#         loss = nn.CrossEntropyLoss()(output, target)
+        # compute the gradients 
+        optimizer.zero_grad()
+        loss.backward()
 
-#         # compute the gradients
-#         optimizer.zero_grad()
-#         loss.backward()
+        # step
+        optimizer.step()
 
-#         # step
-#         optimizer.step()
-
-#         # log 
-#         torch.cuda.synchronize()
-#         metric_logger.update(loss=loss.item())
-#         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-#     # gather the stats from all processes
-#     metric_logger.synchronize_between_processes()
-#     print("Averaged stats:", metric_logger)
-#     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+        # log 
+        torch.cuda.synchronize()
+        metric_logger.update(loss=loss.item())
+        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+    # gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+    print("Averaged stats:", metric_logger)
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
 @torch.no_grad()
@@ -240,8 +242,8 @@ def validate_network(val_loader, model, seg_head, num_classes, spatial_size, eva
 
             batch_size = inp.shape[0]
             # forward            
-            output = model.get_intermediate_layers(inp, n=1)[0]
-            output = output[:, 1:].reshape(batch_size, spatial_size, spatial_size, model.embed_dim).permute(0, 3, 1, 2)
+            output = model.get_patch_tokens(inp)
+            output = output.reshape(batch_size, spatial_size, spatial_size, model.embed_dim).permute(0, 3, 1, 2)
             output = nn.functional.interpolate(output, size=(eval_size, eval_size), mode='bilinear')
             preds = seg_head(output)
             preds = torch.argmax(preds, dim=1).unsqueeze(1) # [B, 1, 448, 448]
@@ -269,12 +271,12 @@ if __name__ == '__main__':
     parser.add_argument('--pretrained_weights', default='', type=str, help="Path to pretrained weights to evaluate.")
     parser.add_argument('--pretrained_head', default='', type=str, help="Path to pretrained head weights to load.")
     parser.add_argument("--checkpoint_key", default="teacher", type=str, help='Key to use in the checkpoint (example: "teacher")')
-    parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
-    parser.add_argument("--lr", default=0.001, type=float, help="""Learning rate at the beginning of
+    parser.add_argument('--epochs', default=25, type=int, help='Number of epochs of training.')
+    parser.add_argument("--lr", default=0.01, type=float, help="""Learning rate at the beginning of
         training (highest LR used during training). The learning rate is linearly scaled
-        with the batch size, and specified here for a reference batch size of 256.
+        with the batch size, and specified here for a reference batch size of 60.
         We recommend tweaking the LR depending on the checkpoint evaluated.""")
-    parser.add_argument('--batch_size_per_gpu', default=128, type=int, help='Per-GPU batch-size')
+    parser.add_argument('--batch_size_per_gpu', default=60, type=int, help='Per-GPU batch-size')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
@@ -286,6 +288,14 @@ if __name__ == '__main__':
     parser.add_argument("--head_type", type=str, choices=['linear', 'fcn'], default="linear")
     parser.add_argument('--num_classes', default=1000, type=int, help='Number of labels for linear classifier')
     parser.add_argument('--eval_size', default=448, type=int, help='Size of groundtruth mask')
+    parser.add_argument('--input_size', default=448, type=int, help='Size of input image')
+    parser.add_argument('--train_mask_size', default=100, type=int, help='Size of gt mask used during training')
     parser.add_argument('--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
+
+    parser.add_argument('--with_learnable_token', action='store_true', help='Reference token with learnable class token.')
+    parser.add_argument('--remove_global_token', action='store_true', help='Whether to remove the global class token.')
+    
     args = parser.parse_args()
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    args.spatial_size = args.input_size // args.patch_size
     eval_linear(args)
