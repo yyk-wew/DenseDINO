@@ -74,6 +74,7 @@ def get_args_parser():
     parser.add_argument('--num_reference', default=1, type=int, help="Number of points sampled per crop. Use k*k points in actual.")
     parser.add_argument('--sampling_mode', type=str, default='random', choices=['random', 'grid'], help='Mode of reference point sampling.')
     parser.add_argument('--mask_mode', type=str, default='020', choices=['020', 'all2pos', 'all2pos_pos2cls', 'all2pos_pos2cls_eye'], help='Masked Attention.')
+    parser.add_argument('--pretrained_weights', default="", type=str, help='Path of pretrained model weights.')
 
     # Temperature teacher parameters
     parser.add_argument('--warmup_teacher_temp', default=0.04, type=float,
@@ -202,6 +203,11 @@ def train_dino(args):
         embed_dim = student.fc.weight.shape[1]
     else:
         print(f"Unknow architecture: {args.arch}")
+
+    # use pretrained weights
+    if args.pretrained_weights != '':
+        utils.load_pretrained_weights(student, args.pretrained_weights, "student", args.arch, args.patch_size)
+        utils.load_pretrained_weights(teacher, args.pretrained_weights, "teacher", args.arch, args.patch_size)
 
     # multi-crop wrapper handles forward with inputs of different resolutions
     student = utils.MultiCropWrapper(student, DINOHead(
