@@ -70,11 +70,12 @@ def get_args_parser():
     parser.add_argument('--given_pos', action='store_true', help='Replace cls_pos_embed with interpolated patch_pos_embed.')
     parser.add_argument('--with_learnable_token', action='store_true', help='Reference token with learnable class token.')
     parser.add_argument('--remove_global_token', action='store_true', help='Whether to remove the global class token.')
-    parser.add_argument('--another_center', action='store_true', help='Use separate centering for given_pos_token.')
     parser.add_argument('--num_reference', default=1, type=int, help="Number of points sampled per crop. Use k*k points in actual.")
     parser.add_argument('--sampling_mode', type=str, default='random', choices=['random', 'grid'], help='Mode of reference point sampling.')
     parser.add_argument('--mask_mode', type=str, default='020', choices=['020', 'all2pos', 'all2pos_pos2cls', 'all2pos_pos2cls_eye'], help='Masked Attention.')
     parser.add_argument('--pretrained_weights', default="", type=str, help='Path of pretrained model weights.')
+    parser.add_argument('--use_global_loss', action='store_true', help='Use original(global) dino loss.')
+    parser.add_argument('--use_ref_loss', action='store_true', help='Add separate centering loss for ref token.')
 
     # Temperature teacher parameters
     parser.add_argument('--warmup_teacher_temp', default=0.04, type=float,
@@ -235,7 +236,8 @@ def train_dino(args):
         teacher_without_ddp = teacher
     student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
     # teacher and student start with the same weights
-    teacher_without_ddp.load_state_dict(student.module.state_dict())
+    if args.pretrained_weights == '':
+        teacher_without_ddp.load_state_dict(student.module.state_dict())
     # there is no backpropagation through the teacher, so no need for gradients
     for p in teacher.parameters():
         p.requires_grad = False
@@ -250,7 +252,8 @@ def train_dino(args):
         args.warmup_teacher_temp_epochs,
         args.epochs,
         remove_global=args.remove_global_token,
-        another_center=args.another_center,
+        use_global_loss=args.use_global_loss,
+        use_ref_loss=args.use_ref_loss
     ).cuda()
 
     # ============ preparing optimizer ... ============
@@ -401,18 +404,20 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
 
 class DINOLoss(nn.Module):
     def __init__(self, out_dim, ncrops, warmup_teacher_temp, teacher_temp,
-                 warmup_teacher_temp_epochs, nepochs, remove_global=False, another_center=False, student_temp=0.1,
-                 center_momentum=0.9):
+                 warmup_teacher_temp_epochs, nepochs, remove_global=False, use_ref_loss=False, use_global_loss=False,
+                 student_temp=0.1, center_momentum=0.9):
         super().__init__()
         self.student_temp = student_temp
         self.center_momentum = center_momentum
         self.ncrops = ncrops
         self.remove_global = remove_global
         self.num_cls_token = 0 if remove_global else 1
-        if not remove_global:
+        assert (not remove_global) or (not use_global_loss) # if use global loss, then remove global must be False
+        if use_global_loss:
             self.register_buffer("center", torch.zeros(1, out_dim))
-        self.another_center = another_center
-        if another_center:
+        self.use_ref_loss = use_ref_loss
+        self.use_global_loss = use_global_loss
+        if use_ref_loss:
             self.register_buffer("ref_center", torch.zeros(1, out_dim))
         # we apply a warm up for the teacher temperature because
         # a too high temperature makes the training instable at the beginning
@@ -430,7 +435,7 @@ class DINOLoss(nn.Module):
             num_ref_point = student_output.shape[1] // 2
 
         student_out = student_output / self.student_temp
-        if not self.remove_global:
+        if self.use_global_loss:
             student_out_global = student_out[:,0].chunk(self.ncrops) # [2+x, [B, dim]]
         if given_pos:
             student_out_ref = student_out[:,self.num_cls_token:].unflatten(1, (2,num_ref_point)).chunk(self.ncrops)   # [2+x, [B, 2, k, dim]]
@@ -438,11 +443,11 @@ class DINOLoss(nn.Module):
         # teacher centering and sharpening
         temp = self.teacher_temp_schedule[epoch]
         # teacher_out = F.softmax((teacher_output - self.center) / temp, dim=-1)
-        if not self.remove_global:
+        if self.use_global_loss:
             teacher_out_global = F.softmax((teacher_output[:,0] - self.center) / temp, dim=-1).detach().chunk(2)  # [2, [B, dim]]
         if given_pos:
             teacher_out_ref_temp = teacher_output[:,self.num_cls_token:].unflatten(1, (self.ncrops,num_ref_point))  # [2B, 2+x, k, dim]
-            if self.another_center:
+            if self.use_ref_loss:
                 teacher_out_ref_temp = F.softmax((teacher_out_ref_temp - self.ref_center) / temp, dim=-1)
             else:
                 teacher_out_ref_temp = F.softmax((teacher_out_ref_temp - self.center) / temp, dim=-1)
@@ -457,24 +462,24 @@ class DINOLoss(nn.Module):
                     # we skip cases where student and teacher operate on the same view
                     continue
                 # global cls token loss
-                if not self.remove_global:
+                if self.use_global_loss:
                     loss = torch.sum(-teacher_out_global[iq] * F.log_softmax(student_out_global[v], dim=-1), dim=-1)
                     global_loss += loss.mean()
                     global_n_loss_terms += 1
                 
                 # given position token loss
-                if given_pos:
+                if self.use_ref_loss:
                     loss = torch.sum(-teacher_out_ref[iq][:,v] * F.log_softmax(student_out_ref[v][:, iq], dim=-1), dim=-1)  # [B, k]
                     ref_loss += loss.mean()
                     ref_n_loss_terms += 1
         global_loss /= global_n_loss_terms
         ref_loss /= ref_n_loss_terms
 
-        if given_pos and not self.remove_global:
+        if self.use_global_loss and self.use_ref_loss:
             total_loss = 0.5 * global_loss + 0.5 * ref_loss
-        elif given_pos and self.remove_global:
+        elif not self.use_global_loss and self.use_ref_loss:
             total_loss = ref_loss
-        elif not given_pos and not self.remove_global:
+        elif self.use_global_loss and not self.use_ref_loss:
             total_loss = global_loss
         else:
             print("Invalid param.")
@@ -495,9 +500,9 @@ class DINOLoss(nn.Module):
         # batch_center: [1, 1+(2+x)*k, D]
 
         # ema update
-        if not self.remove_global:
+        if self.use_global_loss:
             self.center = self.center * self.center_momentum + batch_center[:, 0] * (1 - self.center_momentum)
-        if self.another_center:
+        if self.use_ref_loss:
             self.ref_center = self.ref_center * self.center_momentum + batch_center[:, self.num_cls_token:].mean(dim=1, keepdim=False) * (1 - self.center_momentum)
 
 
