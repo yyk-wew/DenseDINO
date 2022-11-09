@@ -158,7 +158,8 @@ def train_dino(args):
         args.local_crops_scale,
         args.local_crops_number,
         args.num_reference,
-        args.sampling_mode
+        args.sampling_mode, 
+        args.given_pos
     )
     dataset = datasets.ImageFolder(args.data_path, transform=transform)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
@@ -180,13 +181,11 @@ def train_dino(args):
         student = vits.__dict__[args.arch](
             patch_size=args.patch_size,
             drop_path_rate=args.drop_path_rate,  # stochastic depth
-            given_pos=args.given_pos,
             with_learnable_token=args.with_learnable_token,
             remove_global_token=args.remove_global_token
         )
         teacher = vits.__dict__[args.arch](
-            patch_size=args.patch_size, 
-            given_pos=args.given_pos, 
+            patch_size=args.patch_size,  
             with_learnable_token=args.with_learnable_token,
             remove_global_token=args.remove_global_token
         )
@@ -211,15 +210,15 @@ def train_dino(args):
         utils.load_pretrained_weights(teacher, args.pretrained_weights, "teacher", args.arch, args.patch_size)
 
     # multi-crop wrapper handles forward with inputs of different resolutions
-    student = utils.MultiCropWrapper(student, DINOHead(
-        embed_dim,
-        args.out_dim,
-        use_bn=args.use_bn_in_head,
-        norm_last_layer=args.norm_last_layer,
-    ))
+    student = utils.MultiCropWrapper(
+        student, 
+        DINOHead(embed_dim, args.out_dim, use_bn=args.use_bn_in_head, norm_last_layer=args.norm_last_layer) if args.use_global_loss else None,
+        DINOHead(embed_dim, args.out_dim, use_bn=args.use_bn_in_head, norm_last_layer=args.norm_last_layer) if args.use_ref_loss else None
+    )
     teacher = utils.MultiCropWrapper(
         teacher,
-        DINOHead(embed_dim, args.out_dim, args.use_bn_in_head),
+        DINOHead(embed_dim, args.out_dim, args.use_bn_in_head) if args.use_global_loss else None,
+        DINOHead(embed_dim, args.out_dim, args.use_bn_in_head) if args.use_ref_loss else None
     )
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
@@ -251,7 +250,6 @@ def train_dino(args):
         args.teacher_temp,
         args.warmup_teacher_temp_epochs,
         args.epochs,
-        remove_global=args.remove_global_token,
         use_global_loss=args.use_global_loss,
         use_ref_loss=args.use_ref_loss
     ).cuda()
@@ -348,8 +346,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
 
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images]
-        tea_pos = [pos.cuda(non_blocking=True) for pos in tea_pos]
-        stu_pos = [pos.cuda(non_blocking=True) for pos in stu_pos]
+        tea_pos = [pos.cuda(non_blocking=True) for pos in tea_pos] if tea_pos is not None else None
+        stu_pos = [pos.cuda(non_blocking=True) for pos in stu_pos] if stu_pos is not None else None
 
         # sampling reference point
         # images: [(2+x) * [B,3,H,W]]
@@ -359,7 +357,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         with torch.cuda.amp.autocast(fp16_scaler is not None):
             teacher_output = teacher(images[:2], tea_pos, args.mask_mode)  # only the 2 global views pass through the teacher
             student_output = student(images, stu_pos, args.mask_mode)
-            loss, global_loss, ref_loss = dino_loss(student_output, teacher_output, epoch, args.given_pos)
+            loss, global_loss, ref_loss = dino_loss(student_output, teacher_output, epoch)
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()), force=True)
@@ -404,15 +402,13 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
 
 class DINOLoss(nn.Module):
     def __init__(self, out_dim, ncrops, warmup_teacher_temp, teacher_temp,
-                 warmup_teacher_temp_epochs, nepochs, remove_global=False, use_ref_loss=False, use_global_loss=False,
+                 warmup_teacher_temp_epochs, nepochs, use_ref_loss=False, use_global_loss=False,
                  student_temp=0.1, center_momentum=0.9):
         super().__init__()
         self.student_temp = student_temp
         self.center_momentum = center_momentum
         self.ncrops = ncrops
-        self.remove_global = remove_global
-        self.num_cls_token = 0 if remove_global else 1
-        assert (not remove_global) or (not use_global_loss) # if use global loss, then remove global must be False
+
         if use_global_loss:
             self.register_buffer("center", torch.zeros(1, out_dim))
         self.use_ref_loss = use_ref_loss
@@ -427,30 +423,30 @@ class DINOLoss(nn.Module):
             np.ones(nepochs - warmup_teacher_temp_epochs) * teacher_temp
         ))
 
-    def forward(self, student_output, teacher_output, epoch, given_pos=False):
+    def forward(self, student_output, teacher_output, epoch):
         """
         Cross-entropy between softmax outputs of the teacher and student networks.
         """
-        if given_pos:
-            num_ref_point = student_output.shape[1] // 2
+        teacher_out_global, teacher_out_ref = teacher_output
+        student_out_global, student_out_ref = student_output
 
-        student_out = student_output / self.student_temp
+        num_ref_point = student_out_ref.shape[1] // 2
+
         if self.use_global_loss:
-            student_out_global = student_out[:,0].chunk(self.ncrops) # [2+x, [B, dim]]
-        if given_pos:
-            student_out_ref = student_out[:,self.num_cls_token:].unflatten(1, (2,num_ref_point)).chunk(self.ncrops)   # [2+x, [B, 2, k, dim]]
+            student_out_global = student_out_global / self.student_temp
+            student_out_global = student_out_global.squeeze(1).chunk(self.ncrops) # [2+x, [B, dim]]
+        if self.use_ref_loss:
+            student_out_ref = student_out_ref / self.student_temp
+            student_out_ref = student_out_ref.unflatten(1, (2, num_ref_point)).chunk(self.ncrops)   # [2+x, [B, 2, k, dim]]
 
         # teacher centering and sharpening
         temp = self.teacher_temp_schedule[epoch]
         # teacher_out = F.softmax((teacher_output - self.center) / temp, dim=-1)
         if self.use_global_loss:
-            teacher_out_global = F.softmax((teacher_output[:,0] - self.center) / temp, dim=-1).detach().chunk(2)  # [2, [B, dim]]
-        if given_pos:
-            teacher_out_ref_temp = teacher_output[:,self.num_cls_token:].unflatten(1, (self.ncrops,num_ref_point))  # [2B, 2+x, k, dim]
-            if self.use_ref_loss:
-                teacher_out_ref_temp = F.softmax((teacher_out_ref_temp - self.ref_center) / temp, dim=-1)
-            else:
-                teacher_out_ref_temp = F.softmax((teacher_out_ref_temp - self.center) / temp, dim=-1)
+            teacher_out_global = F.softmax((teacher_out_global.squeeze(1) - self.center) / temp, dim=-1).detach().chunk(2)  # [2, [B, dim]]
+        if self.use_ref_loss:
+            teacher_out_ref_temp = teacher_out_ref.unflatten(1, (self.ncrops,num_ref_point))  # [2B, 2+x, k, dim]
+            teacher_out_ref_temp = F.softmax((teacher_out_ref_temp - self.ref_center) / temp, dim=-1)
             teacher_out_ref = teacher_out_ref_temp.detach().chunk(2) # [2, [B, 2+x, k, dim]]
 
         global_loss, ref_loss = 0, 0
@@ -493,6 +489,9 @@ class DINOLoss(nn.Module):
         """
         Update center used for teacher output.
         """
+        num_cls_token, num_ref_token = teacher_output[0].shape[1], teacher_output[1].shape[1]
+        teacher_output = torch.cat(teacher_output, dim=1)
+
         batch_center = torch.sum(teacher_output, dim=0, keepdim=True)
         dist.all_reduce(batch_center)
         batch_center = batch_center / (len(teacher_output) * dist.get_world_size())
@@ -501,15 +500,16 @@ class DINOLoss(nn.Module):
 
         # ema update
         if self.use_global_loss:
-            self.center = self.center * self.center_momentum + batch_center[:, 0] * (1 - self.center_momentum)
+            self.center = self.center * self.center_momentum + batch_center[:, :num_cls_token].squeeze(1) * (1 - self.center_momentum)
         if self.use_ref_loss:
-            self.ref_center = self.ref_center * self.center_momentum + batch_center[:, self.num_cls_token:].mean(dim=1, keepdim=False) * (1 - self.center_momentum)
+            self.ref_center = self.ref_center * self.center_momentum + batch_center[:, num_cls_token:num_cls_token+num_ref_token].mean(dim=1, keepdim=False) * (1 - self.center_momentum)
 
 
 class DataAugmentationDINO(object):
-    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number, num_reference, sampling_mode, min_intersection=0.01):
+    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number, num_reference, sampling_mode, given_pos, min_intersection=0.01):
         self.num_reference = num_reference
         self.sampling_mode = sampling_mode
+        self.given_pos = given_pos
 
         # flip = transforms.RandomHorizontalFlip(p=0.5)
         color_jitter = transforms.Compose([    
@@ -624,37 +624,41 @@ class DataAugmentationDINO(object):
 
             multi_crops.append(img)
 
+        if self.given_pos:
+            # Calculate relative bboxes for each crop pair from aboslute bboxes
+            gc_bboxes, otc_bboxes = self.calculate_bboxes(crop_bboxes)
 
-        # Calculate relative bboxes for each crop pair from aboslute bboxes
-        gc_bboxes, otc_bboxes = self.calculate_bboxes(crop_bboxes)
+            ref_pos_gc, ref_pos_otc = self.sampling_reference_point(gc_bboxes, otc_bboxes)
 
-        ref_pos_gc, ref_pos_otc = self.sampling_reference_point(gc_bboxes, otc_bboxes)
+            tea_pos = ref_pos_gc.chunk(2)   # (2, [1, 2+x, k*k, 2])
+            stu_pos = ref_pos_otc.chunk(ref_pos_otc.shape[0])   # (2+x, [1, 2, k*k, 2])
 
-        tea_pos = ref_pos_gc.chunk(2)   # (2, [1, 2+x, k*k, 2])
-        stu_pos = ref_pos_otc.chunk(ref_pos_otc.shape[0])   # (2+x, [1, 2, k*k, 2])
+            # Adjust reference point coordinate according to flip
+            for i in range(len(flip_record)):
+                if flip_record[i]:
+                    if i < 2:
+                        tea_pos[i][:,:,:,0] = -tea_pos[i][:,:,:,0]
+                        stu_pos[i][:,:,:,0] = -stu_pos[i][:,:,:,0]
+                    else:
+                        stu_pos[i][:,:,:,0] = -stu_pos[i][:,:,:,0]          
 
-        # Adjust reference point coordinate according to flip
-        for i in range(len(flip_record)):
-            if flip_record[i]:
-                if i < 2:
-                    tea_pos[i][:,:,:,0] = -tea_pos[i][:,:,:,0]
-                    stu_pos[i][:,:,:,0] = -stu_pos[i][:,:,:,0]
-                else:
-                    stu_pos[i][:,:,:,0] = -stu_pos[i][:,:,:,0]          
-
-        tea_pos = list(map(lambda x: x.squeeze(0).detach(), tea_pos))
-        stu_pos = list(map(lambda x: x.squeeze(0).detach(), stu_pos))
+            tea_pos = list(map(lambda x: x.squeeze(0).detach(), tea_pos))
+            stu_pos = list(map(lambda x: x.squeeze(0).detach(), stu_pos))
 
         # --May not matter--
         # flip_record contains flip_flag, which is a tensor
         # Memory leak occurs without del
         del flip_record
-        del gc_bboxes, otc_bboxes
+        if self.given_pos:
+            del gc_bboxes, otc_bboxes
 
         # multi_crops: List[2+x Tensor[3,H,W]]
         # tea_pos: List[2 Tensor[2+x,k*k,2]]
         # stu_pos: List[2+x Tensor[2,k*k,2]]
-        return multi_crops, tea_pos, stu_pos
+        if self.given_pos:
+            return multi_crops, tea_pos, stu_pos
+        else:
+            return multi_crops, None, None
 
     def calculate_bboxes(self, crop_bboxes):
         # 1. Calculate two intersection bboxes for each global crop - other crop pair

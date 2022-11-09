@@ -614,12 +614,13 @@ class MultiCropWrapper(nn.Module):
     concatenate all the output features and run the head forward on these
     concatenated features.
     """
-    def __init__(self, backbone, head):
+    def __init__(self, backbone, head, ref_head):
         super(MultiCropWrapper, self).__init__()
         # disable layers dedicated to ImageNet labels classification
         backbone.fc, backbone.head = nn.Identity(), nn.Identity()
         self.backbone = backbone
-        self.head = head
+        self.head = head if head else nn.Identity()
+        self.ref_head = ref_head if ref_head else nn.Identity()
 
     def forward(self, x, pos=None, mask_mode=None):
         # convert to list
@@ -634,18 +635,21 @@ class MultiCropWrapper(nn.Module):
             torch.tensor([inp.shape[-1] for inp in x]),
             return_counts=True,
         )[1], 0)
-        start_idx, output = 0, torch.empty(0).to(x[0].device)
+        start_idx, output_global, output_ref = 0, torch.empty(0).to(x[0].device), torch.empty(0).to(x[0].device)
+
         for end_idx in idx_crops:
-            _out = self.backbone(torch.cat(x[start_idx: end_idx]), torch.cat(pos[start_idx:end_idx] if pos is not None else None), mask_mode=mask_mode)
+            _out_global, _out_ref = self.backbone(torch.cat(x[start_idx: end_idx]), torch.cat(pos[start_idx:end_idx] if pos is not None else None), mask_mode=mask_mode)
             # The output is a tuple with XCiT model. See:
             # https://github.com/facebookresearch/xcit/blob/master/xcit.py#L404-L405
-            if isinstance(_out, tuple):
-                _out = _out[0]
+            # if isinstance(_out, tuple):
+            #     _out = _out[0]
             # accumulate outputs
-            output = torch.cat((output, _out))
+            output_global = torch.cat((output_global, _out_global))
+            output_ref = torch.cat((output_ref, _out_ref))
             start_idx = end_idx
+
         # Run the head forward on the concatenated features.
-        return self.head(output)
+        return self.head(output_global), self.ref_head(output_ref)
 
 
 def get_params_groups(model):

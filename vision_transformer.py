@@ -139,11 +139,10 @@ class VisionTransformer(nn.Module):
     """ Vision Transformer """
     def __init__(self, img_size=[224], patch_size=16, in_chans=3, num_classes=0, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., norm_layer=nn.LayerNorm, given_pos=False, with_learnable_token=False,
+                 drop_path_rate=0., norm_layer=nn.LayerNorm, with_learnable_token=False,
                  remove_global_token=False, **kwargs):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
-        self.given_pos = given_pos
         self.with_learnable_token = with_learnable_token
         self.remove_global_token = remove_global_token
 
@@ -234,7 +233,7 @@ class VisionTransformer(nn.Module):
 
         # add the [REF] token to the embed patch tokens
         num_ref_token = 0
-        if self.given_pos:
+        if pos is not None:
             num_ref_token = pos.shape[1] * pos.shape[2]
             if self.with_learnable_token:   
                 ref_tokens = self.ref_learn_token.expand(1, num_ref_token, -1)
@@ -253,7 +252,7 @@ class VisionTransformer(nn.Module):
         
         pos_embed = patch_pos.expand(B, -1, -1)
         # add REF positional encoding
-        if self.given_pos:
+        if pos is not None:
             ref_pos_embed = self.interpolate_ref_point_pos_encoding(pos, patch_pos) # [B, x, D]
             pos_embed = torch.cat((ref_pos_embed, pos_embed), dim=1)
         
@@ -275,17 +274,16 @@ class VisionTransformer(nn.Module):
         for blk in self.blocks:
             x = blk(x, attn_mask=attn_mask)
         x = self.norm(x)
-
-        num_other_token = 0 if self.remove_global_token else 1
-        num_other_token = num_other_token + pos.shape[1] * pos.shape[2] if self.given_pos else num_other_token
-        x = x[:, :num_other_token]
-
-        if self.training:
-            pass
-        else:
-            x = x.squeeze(1)    
         
-        return x
+        num_cls_token = 0 if self.remove_global_token else 1
+        cls_token = x[:, :num_cls_token]
+        
+        if self.training:
+            num_ref_token = pos.shape[1] * pos.shape[2] if pos is not None else 0
+            ref_token = x[:, num_cls_token:num_cls_token+num_ref_token]
+            return cls_token, ref_token
+        else:
+            return cls_token.squeeze(1)
 
     def prepare_attn_mask(self, x, mask_mode, num_cls_token=0, num_ref_token=0):
         N = x.shape[1]
