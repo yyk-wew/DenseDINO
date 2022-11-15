@@ -427,6 +427,8 @@ class DINOLoss(nn.Module):
         """
         Cross-entropy between softmax outputs of the teacher and student networks.
         """
+        # teacher_out_ref: [2B, (2+x)k, dim]
+        # student_out_ref: [(2+x)B, 2k, dim]
         teacher_out_global, teacher_out_ref = teacher_output
         student_out_global, student_out_ref = student_output
 

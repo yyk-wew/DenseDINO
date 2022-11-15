@@ -80,50 +80,56 @@ def get_args_parser():
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
 
 
-def vis_pos(x, pos, model, images, b_index, crop_index, target_index, name):
+def vis_pos(x, pos, model, images, b_index, crop_index, target_index, name, batch_num, crop_size):
     # -- model.prepare_token --
     B, nc, w, h = x.shape
+    crop_num, sample_num = pos.shape[1], pos.shape[2]
     x = model.patch_embed(x)  # patch linear embedding
+
+    # interpolate patch positional encoding
+    patch_pos = model.interpolate_pos_encoding(x, w, h)  # [1, N, D]
+
+    ref_pos_embed = model.interpolate_ref_point_pos_encoding(pos, patch_pos) # [B, x, D]
     
-    # add the [CLS] token to the embed patch tokens
-    if model.given_pos:
-        num_cls_token = pos.shape[1] * pos.shape[2] + 1
-        if model.with_cls_token:   
-            cls_tokens = model.cls_token.expand(1, num_cls_token, -1)
-        else:
-            cls_tokens = torch.zeros((1, num_cls_token - 1, model.embed_dim)).to(model.cls_token.device)
-            cls_tokens = torch.cat((model.cls_token, cls_tokens), dim=1)
-    else:
-        num_cls_token = 1
-        cls_tokens = model.cls_token
-    cls_tokens = cls_tokens.expand(B, -1, -1)
-    x = torch.cat((cls_tokens, x), dim=1)   # [B, 1+x+N, C]
+    # # add the [CLS] token to the embed patch tokens
+    # if model.given_pos:
+    #     num_cls_token = pos.shape[1] * pos.shape[2] + 1
+    #     if model.with_cls_token:   
+    #         cls_tokens = model.cls_token.expand(1, num_cls_token, -1)
+    #     else:
+    #         cls_tokens = torch.zeros((1, num_cls_token - 1, model.embed_dim)).to(model.cls_token.device)
+    #         cls_tokens = torch.cat((model.cls_token, cls_tokens), dim=1)
+    # else:
+    #     num_cls_token = 1
+    #     cls_tokens = model.cls_token
+    # cls_tokens = cls_tokens.expand(B, -1, -1)
+    # x = torch.cat((cls_tokens, x), dim=1)   # [B, 1+x+N, C]
 
-    patch_pos = model.interpolate_pos_encoding(x, w, h, num_cls_token)
+    # patch_pos = model.interpolate_pos_encoding(x, w, h, num_cls_token)
 
-    if model.given_pos:
-        cls_pos_embed = model.interpolate_ref_point_pos_encoding(x, pos, patch_pos)
-        pos_embed = torch.cat((model.cls_pos_embed.expand(B, -1, -1), cls_pos_embed, patch_pos.expand(B, -1, -1)), dim=1)
-    else:
-        pos_embed = torch.cat((model.cls_pos_embed, patch_pos), dim=1).expand(B, -1, -1)
+    # if model.given_pos:
+    #     cls_pos_embed = model.interpolate_ref_point_pos_encoding(x, pos, patch_pos)
+    #     pos_embed = torch.cat((model.cls_pos_embed.expand(B, -1, -1), cls_pos_embed, patch_pos.expand(B, -1, -1)), dim=1)
+    # else:
+    #     pos_embed = torch.cat((model.cls_pos_embed, patch_pos), dim=1).expand(B, -1, -1)
 
     # -- dino loss --
-    cls_pos_embed = cls_pos_embed.unflatten(1, (2, cls_pos_embed.shape[1] // 2))
-    print("cls_pos_embed", cls_pos_embed.shape)
+    ref_pos_embed = ref_pos_embed.unflatten(1, (crop_num, sample_num))  # [B, x, k*k, embed]
+    print("ref_pos_embed", ref_pos_embed.shape)
 
     # images: 2 * [2B,C,H,W]
-    # x: [2B, 1+2*k+N, embed]
     # patch_pos: [1, 196, embed]
-    # cls_pos_embed: [2B, 2, k, embed]
+    # ref_pos_embed: [2B, 2, k, embed]
     
-    actual_B = B // 2   # Attention: only fits when using crop 2, local crop
+    actual_B = B // batch_num   # Attention: only fits when using crop 2, local crop
+    print(B, batch_num, actual_B)
 
     patch_pos = patch_pos.squeeze(0)    # [196, embed]
-    cls_pos_embed = cls_pos_embed[crop_index * actual_B + b_index][target_index]    # [k, embed]
+    ref_pos_embed = ref_pos_embed[crop_index * actual_B + b_index][target_index]    # [k, embed]
     patch_pos = torch.nn.functional.normalize(patch_pos, p=2, dim=-1)
-    cls_pos_embed = torch.nn.functional.normalize(cls_pos_embed, p=2, dim=-1)
+    ref_pos_embed = torch.nn.functional.normalize(ref_pos_embed, p=2, dim=-1)
 
-    sim_mat = patch_pos @ cls_pos_embed.T
+    sim_mat = patch_pos @ ref_pos_embed.T
     sim_mat = sim_mat.reshape(int(math.sqrt(patch_pos.shape[0])), int(math.sqrt(patch_pos.shape[0])), -1)
     print("sim_mat", sim_mat.shape)    # should be [14, 14, k]
     vis_data = sim_mat.cpu().numpy()
@@ -140,7 +146,7 @@ def vis_pos(x, pos, model, images, b_index, crop_index, target_index, name):
     pos = pos[crop_index * actual_B + b_index][target_index]  # [k, 2]
     pos = pos.cpu().numpy()
 
-    pos = (pos + 1.) / 2. * 224.
+    pos = (pos + 1.) / 2. * crop_size
 
     num_plots = pos.shape[-2] + 1
     fig, ax = plt.subplots(1, num_plots,figsize=((num_plots)*5, 5))
@@ -233,12 +239,13 @@ if __name__ == "__main__":
             args.local_crops_scale,
             args.local_crops_number,
             args.num_reference,
-            args.sampling_mode
+            args.sampling_mode,
+            args.given_pos
         )
     dataset = datasets.ImageFolder(args.data_path, transform=transform)
     data_loader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=1,
+        batch_size=5,
         num_workers=1,
         pin_memory=True,
         drop_last=True,
@@ -254,12 +261,16 @@ if __name__ == "__main__":
         
         # -- Multi-crop Wrapper --
         start_idx, end_idx = 0, 2
-        x = torch.cat(images[start_idx: end_idx])
-        pos_tea = torch.cat(tea_pos[start_idx:end_idx])
-        pos_stu = torch.cat(stu_pos[start_idx:end_idx])
+        x0 = torch.cat(images[0:2])
+        pos_tea0 = torch.cat(tea_pos[0:2])
+        pos_stu0 = torch.cat(stu_pos[0:2])
+
+        x1 = torch.cat(images[2:10])
+        pos_stu1 = torch.cat(stu_pos[2:10])
         
-        vis_pos(x, pos_tea, model, images, b_index=0, crop_index=0, target_index=1, name='tea_vis.png')
-        vis_pos(x, pos_stu, model, images, b_index=0, crop_index=1, target_index=0, name='stu_vis.png')
+        vis_pos(x0, pos_tea0, model, images[0:2], b_index=0, crop_index=0, target_index=2, name='tea_vis.png', batch_num=2, crop_size=224)
+        # vis_pos(x0, pos_stu0, model, images, b_index=0, crop_index=1, target_index=0, name='stu_vis.png', batch_num=2, crop_size=224)
+        vis_pos(x1, pos_stu1, model, images[2:10], b_index=0, crop_index=0, target_index=0, name='stu_vis.png', batch_num=8, crop_size=96)
 
         break
         
