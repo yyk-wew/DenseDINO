@@ -76,6 +76,7 @@ def get_args_parser():
     parser.add_argument('--pretrained_weights', default="", type=str, help='Path of pretrained model weights.')
     parser.add_argument('--use_global_loss', action='store_true', help='Use original(global) dino loss.')
     parser.add_argument('--use_ref_loss', action='store_true', help='Add separate centering loss for ref token.')
+    parser.add_argument('--use_all_crop_ref', action='store_true', help='Use all crop for ref loss. If False, only use global crop.')
 
     # Temperature teacher parameters
     parser.add_argument('--warmup_teacher_temp', default=0.04, type=float,
@@ -251,7 +252,8 @@ def train_dino(args):
         args.warmup_teacher_temp_epochs,
         args.epochs,
         use_global_loss=args.use_global_loss,
-        use_ref_loss=args.use_ref_loss
+        use_ref_loss=args.use_ref_loss,
+        use_all_crop_ref=args.use_all_crop_ref
     ).cuda()
 
     # ============ preparing optimizer ... ============
@@ -402,12 +404,13 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
 
 class DINOLoss(nn.Module):
     def __init__(self, out_dim, ncrops, warmup_teacher_temp, teacher_temp,
-                 warmup_teacher_temp_epochs, nepochs, use_ref_loss=False, use_global_loss=False,
+                 warmup_teacher_temp_epochs, nepochs, use_ref_loss=False, use_global_loss=False, use_all_crop_ref=True,
                  student_temp=0.1, center_momentum=0.9):
         super().__init__()
         self.student_temp = student_temp
         self.center_momentum = center_momentum
         self.ncrops = ncrops
+        self.use_all_crop_ref = use_all_crop_ref
 
         if use_global_loss:
             self.register_buffer("center", torch.zeros(1, out_dim))
@@ -467,9 +470,10 @@ class DINOLoss(nn.Module):
                 
                 # given position token loss
                 if self.use_ref_loss:
-                    loss = torch.sum(-teacher_out_ref[iq][:,v] * F.log_softmax(student_out_ref[v][:, iq], dim=-1), dim=-1)  # [B, k]
-                    ref_loss += loss.mean()
-                    ref_n_loss_terms += 1
+                    if self.use_all_crop_ref or v < 2:
+                        loss = torch.sum(-teacher_out_ref[iq][:,v] * F.log_softmax(student_out_ref[v][:, iq], dim=-1), dim=-1)  # [B, k]
+                        ref_loss += loss.mean()
+                        ref_n_loss_terms += 1
         global_loss /= global_n_loss_terms
         ref_loss /= ref_n_loss_terms
 
@@ -504,7 +508,11 @@ class DINOLoss(nn.Module):
         if self.use_global_loss:
             self.center = self.center * self.center_momentum + batch_center[:, :num_cls_token].squeeze(1) * (1 - self.center_momentum)
         if self.use_ref_loss:
-            self.ref_center = self.ref_center * self.center_momentum + batch_center[:, num_cls_token:num_cls_token+num_ref_token].mean(dim=1, keepdim=False) * (1 - self.center_momentum)
+            batch_center_ref = batch_center[:, num_cls_token:num_cls_token+num_ref_token]
+            num_ref_point = batch_center_ref.shape[1] // self.ncrops
+            # only use global pos token for center updating
+            batch_center_ref = batch_center_ref.unflatten(1, (self.ncrops, num_ref_point))[:, :2].flatten(1,2)
+            self.ref_center = self.ref_center * self.center_momentum + batch_center_ref.mean(dim=1, keepdim=False) * (1 - self.center_momentum)
 
 
 class DataAugmentationDINO(object):
