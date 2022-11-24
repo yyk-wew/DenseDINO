@@ -20,6 +20,7 @@ import time
 import math
 import json
 from pathlib import Path
+from typing import List
 
 import numpy as np
 from PIL import Image
@@ -338,13 +339,19 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
                     fp16_scaler, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
-    for it, ((images, tea_pos, stu_pos), _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    for it, (input, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
             param_group["lr"] = lr_schedule[it]
             if i == 0:  # only the first group is regularized
                 param_group["weight_decay"] = wd_schedule[it]
+
+        if args.given_pos:
+            images, tea_pos, stu_pos = input
+        else:
+            images = input
+            tea_pos, stu_pos = None, None
 
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images]
@@ -496,7 +503,14 @@ class DINOLoss(nn.Module):
         Update center used for teacher output.
         """
         num_cls_token, num_ref_token = teacher_output[0].shape[1], teacher_output[1].shape[1]
-        teacher_output = torch.cat(teacher_output, dim=1)
+        if num_cls_token > 0 and num_ref_token > 0:
+            teacher_output = torch.cat(teacher_output, dim=1)
+        elif num_cls_token > 0 and num_ref_token == 0:
+            teacher_output = teacher_output[0]
+        elif num_cls_token == 0 and num_ref_token > 0:
+            teacher_output = teacher_output[1]
+        else:
+            raise RuntimeError("Invalid token number.")
 
         batch_center = torch.sum(teacher_output, dim=0, keepdim=True)
         dist.all_reduce(batch_center)
@@ -668,7 +682,7 @@ class DataAugmentationDINO(object):
         if self.given_pos:
             return multi_crops, tea_pos, stu_pos
         else:
-            return multi_crops, None, None
+            return multi_crops
 
     def calculate_bboxes(self, crop_bboxes):
         # 1. Calculate two intersection bboxes for each global crop - other crop pair
