@@ -81,6 +81,7 @@ def get_args_parser():
     parser.add_argument('--use_all_crop_global', action='store_true', help='Use all crop for global dino loss. If False, only use global crop.')
     parser.add_argument('--global_crops_size', type=int, default=224, help='Size of global crop.')
     parser.add_argument('--local_crops_size', type=int, default=96, help='Size of global crop.')
+    parser.add_argument('--detach_pos_embed', action='store_true', help='Whether to detach patch_pos_embed when interpolating ref_token_pos.')
 
     # Temperature teacher parameters
     parser.add_argument('--warmup_teacher_temp', default=0.04, type=float,
@@ -189,12 +190,14 @@ def train_dino(args):
             patch_size=args.patch_size,
             drop_path_rate=args.drop_path_rate,  # stochastic depth
             with_learnable_token=args.with_learnable_token,
-            remove_global_token=args.remove_global_token
+            remove_global_token=args.remove_global_token,
+            detach_pos_embed=args.detach_pos_embed
         )
         teacher = vits.__dict__[args.arch](
             patch_size=args.patch_size,  
             with_learnable_token=args.with_learnable_token,
-            remove_global_token=args.remove_global_token
+            remove_global_token=args.remove_global_token,
+            detach_pos_embed=args.detach_pos_embed
         )
         embed_dim = student.embed_dim
     # if the network is a XCiT

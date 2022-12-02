@@ -140,11 +140,12 @@ class VisionTransformer(nn.Module):
     def __init__(self, img_size=[224], patch_size=16, in_chans=3, num_classes=0, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., norm_layer=nn.LayerNorm, with_learnable_token=False,
-                 remove_global_token=False, **kwargs):
+                 remove_global_token=False, detach_pos_embed=False, **kwargs):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
         self.with_learnable_token = with_learnable_token
         self.remove_global_token = remove_global_token
+        self.detach_pos_embed = detach_pos_embed
 
         self.patch_embed = PatchEmbed(
             img_size=img_size[0], patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
@@ -219,6 +220,9 @@ class VisionTransformer(nn.Module):
         patch_pos_embed = patch_pos_embed.reshape(1, int(math.sqrt(N)), int(math.sqrt(N)), dim).permute(0, 3, 1, 2).expand(B, -1, -1, -1)
         # patch_pos_embed: [B, embed, H, W]
 
+        if self.detach_pos_embed:
+            patch_pos_embed = patch_pos_embed.detach()
+            
         ref_pos_embed = nn.functional.grid_sample(input=patch_pos_embed, grid=pos, mode='bicubic')  # [B, embed, x, k]
         ref_pos_embed = ref_pos_embed.flatten(2,3).permute(0, 2, 1)   # [B, x*k, embed]
 
