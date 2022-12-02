@@ -79,6 +79,8 @@ def get_args_parser():
     parser.add_argument('--use_ref_loss', action='store_true', help='Add separate centering loss for ref token.')
     parser.add_argument('--use_all_crop_ref', action='store_true', help='Use all crop for ref loss. If False, only use global crop.')
     parser.add_argument('--use_all_crop_global', action='store_true', help='Use all crop for global dino loss. If False, only use global crop.')
+    parser.add_argument('--global_crops_size', type=int, default=224, help='Size of global crop.')
+    parser.add_argument('--local_crops_size', type=int, default=96, help='Size of global crop.')
 
     # Temperature teacher parameters
     parser.add_argument('--warmup_teacher_temp', default=0.04, type=float,
@@ -162,7 +164,9 @@ def train_dino(args):
         args.local_crops_number,
         args.num_reference,
         args.sampling_mode, 
-        args.given_pos
+        args.given_pos,
+        global_crops_size=args.global_crops_size,
+        local_crops_size=args.local_crops_size
     )
     dataset = datasets.ImageFolder(args.data_path, transform=transform)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
@@ -523,7 +527,8 @@ class DINOLoss(nn.Module):
 
 
 class DataAugmentationDINO(object):
-    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number, num_reference, sampling_mode, given_pos, min_intersection=0.01):
+    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number, num_reference, sampling_mode, given_pos, min_intersection=0.01,
+                 global_crops_size=224, local_crops_size=96):
         self.num_reference = num_reference
         self.sampling_mode = sampling_mode
         self.given_pos = given_pos
@@ -547,7 +552,7 @@ class DataAugmentationDINO(object):
             utils.GaussianBlur(1.0),
             normalize,
         ])
-        self.global_crop1 = transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=InterpolationMode.BICUBIC)
+        self.global_crop1 = transforms.RandomResizedCrop(global_crops_size, scale=global_crops_scale, interpolation=InterpolationMode.BICUBIC)
         # second global crop
         self.global_transfo2 = transforms.Compose([
             color_jitter,
@@ -555,7 +560,7 @@ class DataAugmentationDINO(object):
             utils.Solarization(0.2),
             normalize,
         ])
-        self.global_crop2 = transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=InterpolationMode.BICUBIC)
+        self.global_crop2 = transforms.RandomResizedCrop(global_crops_size, scale=global_crops_scale, interpolation=InterpolationMode.BICUBIC)
         # transformation for the local small crops
         self.local_crops_number = local_crops_number
         self.local_transfo = transforms.Compose([
@@ -563,7 +568,7 @@ class DataAugmentationDINO(object):
             utils.GaussianBlur(p=0.5),
             normalize,
         ])
-        self.local_crop = transforms.RandomResizedCrop(96, scale=local_crops_scale, interpolation=InterpolationMode.BICUBIC)
+        self.local_crop = transforms.RandomResizedCrop(local_crops_size, scale=local_crops_scale, interpolation=InterpolationMode.BICUBIC)
 
         self.crop_list = [self.global_crop1, self.global_crop2]
         self.crop_list.extend([self.local_crop] * self.local_crops_number)
@@ -571,7 +576,7 @@ class DataAugmentationDINO(object):
         # params for leopart locating bbox
         self.min_intersection = min_intersection
         self.nmb_crops = [2, self.local_crops_number]
-        self.size_crops = [224, 96]
+        self.size_crops = [global_crops_size, local_crops_size]
 
     # def __call__(self, image):
     #     crops = []
@@ -719,6 +724,11 @@ class DataAugmentationDINO(object):
             num_reference_point = self.num_reference * self.num_reference   # To align with "grid" mode
             ref_relate_pos = torch.rand((gc_bboxes.shape[0], gc_bboxes.shape[1], num_reference_point, 2))    # [2, 2+x, k*k, 2]
         elif self.sampling_mode == 'grid':
+            x = torch.linspace(0, 1, steps=2*self.num_reference+1)[1:-1:2]      # [k, k]
+            y = torch.linspace(0, 1, steps=2*self.num_reference+1)[1:-1:2]
+            x, y = torch.meshgrid(x, y)
+            ref_relate_pos = torch.stack((x.flatten(), y.flatten()), dim=-1)    # [k*k, 2]
+            ref_relate_pos = torch.repeat(gc_bboxes.shape[0], gc_bboxes.shape[1], 1, 1)
             raise RuntimeError("Not implemented yet.")
         else:
             # sanity check
