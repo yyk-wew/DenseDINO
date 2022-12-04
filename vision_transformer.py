@@ -257,7 +257,7 @@ class VisionTransformer(nn.Module):
         pos_embed = patch_pos.expand(B, -1, -1)
         # add REF positional encoding
         if pos is not None:
-            ref_pos_embed = self.interpolate_ref_point_pos_encoding(pos, patch_pos) # [B, x, D]
+            ref_pos_embed = self.interpolate_ref_point_pos_encoding(pos, self.patch_pos_embed) # [B, x, D]
             pos_embed = torch.cat((ref_pos_embed, pos_embed), dim=1)
         
         # add CLS positional encoding
