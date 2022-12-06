@@ -73,9 +73,9 @@ def extract_feature_pipeline(args):
 
     # ============ extract features ... ============
     print("Extracting features for train set...")
-    train_features = extract_features(model, data_loader_train, args.use_cuda)
+    train_features = extract_features(model, data_loader_train, args.use_cuda, avgpooling=args.use_avgpooling)
     print("Extracting features for val set...")
-    test_features = extract_features(model, data_loader_val, args.use_cuda)
+    test_features = extract_features(model, data_loader_val, args.use_cuda, avgpooling=args.use_avgpooling)
 
     if utils.get_rank() == 0:
         train_features = nn.functional.normalize(train_features, dim=1, p=2)
@@ -93,7 +93,7 @@ def extract_feature_pipeline(args):
 
 
 @torch.no_grad()
-def extract_features(model, data_loader, use_cuda=True, multiscale=False):
+def extract_features(model, data_loader, use_cuda=True, multiscale=False, avgpooling=False):
     metric_logger = utils.MetricLogger(delimiter="  ")
     features = None
     for samples, index in metric_logger.log_every(data_loader, 10):
@@ -102,7 +102,10 @@ def extract_features(model, data_loader, use_cuda=True, multiscale=False):
         if multiscale:
             feats = utils.multi_scale(samples, model)
         else:
-            feats = model(samples).clone()
+            if avgpooling:
+                feats = model.get_patch_tokens(samples).mean(dim=-2, keepdim=False).clone()
+            else:
+                feats = model(samples).clone()
 
         # init storage feature matrix
         if dist.get_rank() == 0 and features is None:
@@ -213,6 +216,7 @@ if __name__ == '__main__':
     parser.add_argument('--data_path', default='/path/to/imagenet/', type=str)
     # --- new ---
     parser.add_argument('--with_learnable_token', action='store_true', help='Reference token with learnable class token.')
+    parser.add_argument('--use_avgpooling', action='store_true', help='Avgpooling patch tokens as features.')
     # -----------
     args = parser.parse_args()
 
