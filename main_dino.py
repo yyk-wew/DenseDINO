@@ -731,8 +731,7 @@ class DataAugmentationDINO(object):
             y = torch.linspace(0, 1, steps=2*self.num_reference+1)[1:-1:2]
             x, y = torch.meshgrid(x, y)
             ref_relate_pos = torch.stack((x.flatten(), y.flatten()), dim=-1)    # [k*k, 2]
-            ref_relate_pos = torch.repeat(gc_bboxes.shape[0], gc_bboxes.shape[1], 1, 1)
-            raise RuntimeError("Not implemented yet.")
+            ref_relate_pos = ref_relate_pos.repeat(gc_bboxes.shape[0], gc_bboxes.shape[1], 1, 1)     # [2, 2+x, k*k, 2]
         else:
             # sanity check
             raise RuntimeError("Invalid sampling mode.")
