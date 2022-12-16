@@ -223,7 +223,7 @@ class VisionTransformer(nn.Module):
         if self.detach_pos_embed:
             patch_pos_embed = patch_pos_embed.detach()
             
-        ref_pos_embed = nn.functional.grid_sample(input=patch_pos_embed, grid=pos, mode='bicubic')  # [B, embed, x, k]
+        ref_pos_embed = nn.functional.grid_sample(input=patch_pos_embed, grid=pos, mode='bicubic', padding_mode='border')  # [B, embed, x, k]
         ref_pos_embed = ref_pos_embed.flatten(2,3).permute(0, 2, 1)   # [B, x*k, embed]
 
         return ref_pos_embed
