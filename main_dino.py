@@ -82,6 +82,7 @@ def get_args_parser():
     parser.add_argument('--global_crops_size', type=int, default=224, help='Size of global crop.')
     parser.add_argument('--local_crops_size', type=int, default=96, help='Size of global crop.')
     parser.add_argument('--detach_pos_embed', action='store_true', help='Whether to detach patch_pos_embed when interpolating ref_token_pos.')
+    parser.add_argument('--finetune', action='store_true', help='Train of finetune.')
 
     # Temperature teacher parameters
     parser.add_argument('--warmup_teacher_temp', default=0.04, type=float,
@@ -214,11 +215,6 @@ def train_dino(args):
     else:
         print(f"Unknow architecture: {args.arch}")
 
-    # use pretrained weights
-    if args.pretrained_weights != '':
-        utils.load_pretrained_weights(student, args.pretrained_weights, "student", args.arch, args.patch_size)
-        utils.load_pretrained_weights(teacher, args.pretrained_weights, "teacher", args.arch, args.patch_size)
-
     # multi-crop wrapper handles forward with inputs of different resolutions
     student = utils.MultiCropWrapper(
         student, 
@@ -245,7 +241,12 @@ def train_dino(args):
         teacher_without_ddp = teacher
     student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
     # teacher and student start with the same weights
-    if args.pretrained_weights == '':
+    # use pretrained weights
+    if args.finetune:
+        assert args.pretrained_weights != ""
+        utils.load_full_ckpt(student, args.pretrained_weights, "student")
+        utils.load_full_ckpt(teacher, args.pretrained_weights, "teacher")
+    else:
         teacher_without_ddp.load_state_dict(student.module.state_dict())
     # there is no backpropagation through the teacher, so no need for gradients
     for p in teacher.parameters():

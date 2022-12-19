@@ -70,6 +70,34 @@ class Solarization(object):
         else:
             return img
 
+def load_full_ckpt(model, pretrained_weights, checkpoint_key):
+    assert os.path.isfile(pretrained_weights)
+
+    state_dict = torch.load(pretrained_weights, map_location='cpu')
+    if checkpoint_key is not None and checkpoint_key in state_dict:
+        print(f"Take key {checkpoint_key} in provided checkpoint dict")
+        state_dict = state_dict[checkpoint_key]
+    
+    # replace `pos_embed` with `patch` and `cls`
+    temp_state_dict = dict()
+    for k in state_dict.keys():
+        if 'pos_embed' in k:
+            temp_state_dict[k.replace('pos_embed', 'patch_pos_embed')] = state_dict[k][:, 1:, :]
+            temp_state_dict[k.replace('pos_embed', 'cls_pos_embed')] = state_dict[k][:, :1, :]
+        else:
+            temp_state_dict[k] = state_dict[k]
+    state_dict = temp_state_dict    
+
+    # add `ref_head` if needed
+    ref_head_state_dict = dict()
+    for key in state_dict.keys():
+        if 'head' in key:
+            ref_head_state_dict[key.replace("head", "ref_head")] = state_dict[key]
+    state_dict = {**state_dict, **ref_head_state_dict}    
+    
+    msg = model.load_state_dict(state_dict, strict=False)
+    print('Pretrained weights found at {} and loaded with msg: {}'.format(pretrained_weights, msg))
+
 
 def load_pretrained_weights(model, pretrained_weights, checkpoint_key, model_name, patch_size):
     if os.path.isfile(pretrained_weights):
