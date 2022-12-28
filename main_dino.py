@@ -724,7 +724,7 @@ class DataAugmentationDINO(object):
     def sampling_reference_point(self, gc_bboxes, otc_bboxes):
         # gc_bboxes: [2, 2+x, 4], otc_bboxes: [2+x, 2, 4]
         if self.sampling_mode == 'random':
-            num_reference_point = self.num_reference * self.num_reference   # To align with "grid" mode
+            num_reference_point = self.num_reference
             ref_relate_pos = torch.rand((gc_bboxes.shape[0], gc_bboxes.shape[1], num_reference_point, 2))    # [2, 2+x, k*k, 2]
         elif self.sampling_mode == 'grid':
             x = torch.linspace(0, 1, steps=2*self.num_reference+1)[1:-1:2]      # [k, k]
