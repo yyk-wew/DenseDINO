@@ -27,6 +27,8 @@ from torchvision import models as torchvision_models
 import utils
 import vision_transformer as vits
 
+import sys
+
 
 def eval_linear(args):
     utils.init_distributed_mode(args)
@@ -163,7 +165,7 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
         # forward
         with torch.no_grad():
             if "vit" in args.arch:
-                intermediate_output = model.get_intermediate_layers(inp, n)
+                intermediate_output = model.get_intermediate_layers(inp, n=n)
                 output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
                 if avgpool:
                     output = torch.cat((output.unsqueeze(-1), torch.mean(intermediate_output[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
@@ -205,7 +207,7 @@ def validate_network(val_loader, model, linear_classifier, n, avgpool):
         # forward
         with torch.no_grad():
             if "vit" in args.arch:
-                intermediate_output = model.get_intermediate_layers(inp, n)
+                intermediate_output = model.get_intermediate_layers(inp, n=n)
                 output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
                 if avgpool:
                     output = torch.cat((output.unsqueeze(-1), torch.mean(intermediate_output[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
