@@ -68,7 +68,13 @@ def extract_feature_pipeline(args):
         print(f"Architecture {args.arch} non supported")
         sys.exit(1)
     model.cuda()
-    if 'leopart' in args.pretrained_weights:
+    if 'our-leopart' in args.pretrained_weights:
+        state_dict = torch.load(args.pretrained_weights)[args.checkpoint_key]
+        state_dict['patch_pos_embed'] = state_dict['pos_embed'][:, 1:, :]
+        state_dict['cls_pos_embed'] = state_dict['pos_embed'][:, :1, :]
+        msg = model.load_state_dict(state_dict, strict=False)
+        print('Pretrained weights found at {} and loaded with msg: {}'.format(args.pretrained_weights, msg))
+    elif 'leopart' in args.pretrained_weights:
         state_dict = torch.load(args.pretrained_weights)
         state_dict = {k.replace("model.", ""): v for k, v in state_dict.items()}
         state_dict['patch_pos_embed'] = state_dict['pos_embed'][:, 1:, :]
