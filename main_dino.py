@@ -83,6 +83,7 @@ def get_args_parser():
     parser.add_argument('--local_crops_size', type=int, default=96, help='Size of global crop.')
     parser.add_argument('--detach_pos_embed', action='store_true', help='Whether to detach patch_pos_embed when interpolating ref_token_pos.')
     parser.add_argument('--finetune', action='store_true', help='Train of finetune.')
+    parser.add_argument('--ft_ablate', action='store_true', help='Ablation study of feature map supervision.')
 
     # Temperature teacher parameters
     parser.add_argument('--warmup_teacher_temp', default=0.04, type=float,
@@ -374,8 +375,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
 
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
-            teacher_output = teacher(images[:2], tea_pos, args.mask_mode)  # only the 2 global views pass through the teacher
-            student_output = student(images, stu_pos, args.mask_mode)
+            teacher_output = teacher(args.ft_ablate, images[:2], tea_pos, args.mask_mode)  # only the 2 global views pass through the teacher
+            student_output = student(args.ft_ablate, images, stu_pos, args.mask_mode)
             loss, global_loss, ref_loss = dino_loss(student_output, teacher_output, epoch)
 
         if not math.isfinite(loss.item()):

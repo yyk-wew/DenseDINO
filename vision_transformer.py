@@ -272,7 +272,13 @@ class VisionTransformer(nn.Module):
 
         return self.pos_drop(x), attn_mask
 
-    def forward(self, x, pos=None, mask_mode=None):
+    def forward(self, abl, x, pos=None, mask_mode=None):
+        if abl:
+            return self.forward_ablation(x, pos)
+        else:
+            return self.forward_impl(x, pos, mask_mode)
+
+    def forward_impl(self, x, pos, mask_mode):
         x, attn_mask = self.prepare_tokens(x, pos, mask_mode)
 
         for blk in self.blocks:
@@ -288,6 +294,50 @@ class VisionTransformer(nn.Module):
             return cls_token, ref_token
         else:
             return cls_token.squeeze(1)
+
+    def forward_ablation(self, x, pos):
+        B, nc, w, h = x.shape
+        x = self.patch_embed(x)  # patch linear embedding: [B, N, D]
+
+        # interpolate patch positional encoding
+        patch_pos = self.interpolate_pos_encoding(x, w, h)  # [1, N, D]
+
+        # add the [CLS] token to the embed patch tokens
+        num_cls_token = 0
+        if not self.remove_global_token:
+            num_cls_token = 1
+            cls_tokens = self.cls_token.expand(B, -1, -1)
+            x = torch.cat((cls_tokens, x), dim=1)   # [B, 1+x+N, D]
+        
+        pos_embed = patch_pos.expand(B, -1, -1)
+        
+        # add CLS positional encoding
+        if not self.remove_global_token:
+            pos_embed = torch.cat((self.cls_pos_embed.expand(B, -1, -1), pos_embed), dim=1)
+
+        # add positional encoding to each token
+        x = x + pos_embed
+
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.norm(x)
+        
+        cls_token = x[:, :num_cls_token]
+        
+        patch_tokens = x[:, num_cls_token:]  
+
+        N = patch_tokens.shape[1]
+        dim = patch_tokens.shape[-1]
+        B = pos.shape[0]
+        
+        patch_tokens = patch_tokens.reshape(B, int(math.sqrt(N)), int(math.sqrt(N)), dim).permute(0, 3, 1, 2)
+        # patch_tokens: [B, embed, H, W]
+            
+        ref_token = nn.functional.grid_sample(input=patch_tokens, grid=pos, mode='bicubic')  # [B, embed, x, k]
+        ref_token = ref_token.flatten(2,3).permute(0, 2, 1)   # [B, x*k, embed]
+
+        return cls_token, ref_token
+
 
     def prepare_attn_mask(self, x, mask_mode, num_cls_token=0, num_ref_token=0):
         N = x.shape[1]
