@@ -272,7 +272,7 @@ class VisionTransformer(nn.Module):
 
         return self.pos_drop(x), attn_mask
 
-    def forward(self, abl, x, pos=None, mask_mode=None):
+    def forward(self, x, pos=None, mask_mode=None, abl=False):
         if abl:
             return self.forward_ablation(x, pos)
         else:

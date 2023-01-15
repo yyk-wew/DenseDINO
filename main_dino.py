@@ -84,6 +84,7 @@ def get_args_parser():
     parser.add_argument('--detach_pos_embed', action='store_true', help='Whether to detach patch_pos_embed when interpolating ref_token_pos.')
     parser.add_argument('--finetune', action='store_true', help='Train of finetune.')
     parser.add_argument('--ft_ablate', action='store_true', help='Ablation study of feature map supervision.')
+    parser.add_argument('--alpha', default=1., type=float, help='Loss weight of class token, (1-alpha) for reference token.')
 
     # Temperature teacher parameters
     parser.add_argument('--warmup_teacher_temp', default=0.04, type=float,
@@ -375,9 +376,9 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
 
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
-            teacher_output = teacher(args.ft_ablate, images[:2], tea_pos, args.mask_mode)  # only the 2 global views pass through the teacher
-            student_output = student(args.ft_ablate, images, stu_pos, args.mask_mode)
-            loss, global_loss, ref_loss = dino_loss(student_output, teacher_output, epoch)
+            teacher_output = teacher(images[:2], tea_pos, args.mask_mode, abl=args.ft_ablate)  # only the 2 global views pass through the teacher
+            student_output = student(images, stu_pos, args.mask_mode, abl=args.ft_ablate)
+            loss, global_loss, ref_loss = dino_loss(student_output, teacher_output, epoch, args.alpha)
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()), force=True)
@@ -446,7 +447,7 @@ class DINOLoss(nn.Module):
             np.ones(nepochs - warmup_teacher_temp_epochs) * teacher_temp
         ))
 
-    def forward(self, student_output, teacher_output, epoch):
+    def forward(self, student_output, teacher_output, epoch, alpha=1.):
         """
         Cross-entropy between softmax outputs of the teacher and student networks.
         """
@@ -499,7 +500,7 @@ class DINOLoss(nn.Module):
         ref_loss /= ref_n_loss_terms
 
         if self.use_global_loss and self.use_ref_loss:
-            total_loss = 0.5 * global_loss + 0.5 * ref_loss
+            total_loss = alpha * global_loss + (1. - alpha) * ref_loss
         elif not self.use_global_loss and self.use_ref_loss:
             total_loss = ref_loss
         elif self.use_global_loss and not self.use_ref_loss:
