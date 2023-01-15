@@ -33,6 +33,7 @@ from PIL import Image
 
 import utils
 import vision_transformer as vits
+from matplotlib.axis import Tick
 
 
 def apply_mask(image, mask, color, alpha=0.5):
@@ -109,17 +110,16 @@ if __name__ == '__main__':
     parser.add_argument('--output_name', default='.', help='Path where to save visualizations.')
     parser.add_argument("--threshold", type=float, default=None, help="""We visualize masks
         obtained by thresholding the self-attention maps to keep xx% of the mass.""")
-    parser.add_argument('--num_cls_token', default=1, type=int, help="Number of cls_token")
     parser.add_argument('--given_pos', action='store_true', help='Replace cls_pos_embed with patch_pos_embed.')
-    parser.add_argument('--with_cls_token', action='store_true', help='With learnable class token.')
     parser.add_argument('--mask_mode', type=str, default='020', choices=['020', 'all2pos', 'all2pos_pos2cls', 'all2pos_pos2cls_eye'], help='Masked Attention.')
     parser.add_argument('--token_index', type=int, default=0, help='Token used for visualization.')
     parser.add_argument('--ref_coord', type=float, nargs='+', default=(0.0, 0.0), help='Coordinate of reference point, in (x,y) format.')
+    parser.add_argument('--depth', type=int, default=1, help='Coordinate of reference point, in (x,y) format.')
     args = parser.parse_args()
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     # build model
-    model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0, num_cls_token=args.num_cls_token, given_pos=args.given_pos, with_cls_token=args.with_cls_token)
+    model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0)
     for p in model.parameters():
         p.requires_grad = False
     model.eval()
@@ -201,13 +201,13 @@ if __name__ == '__main__':
     print("Attention shape", attentions.shape)
 
     # we keep only the output patch attention
-    attentions = attentions[0, :, args.token_index, -196:].reshape(nh, -1)
+    attentions = attentions[0, :, args.token_index, -(w_featmap * h_featmap):].reshape(nh, -1)
 
     # get output
     output_tokens = model.get_intermediate_layers(img.to(device), pos=pos.to(device) if pos is not None else None, mask_mode=args.mask_mode)[0][0]
     output_tokens = torch.nn.functional.normalize(output_tokens, dim=-1, p=2)
     target_token = output_tokens[args.token_index]  # [1, D]
-    patch_tokens = output_tokens[-196:]     # [196, D]
+    patch_tokens = output_tokens[-(w_featmap * h_featmap):]     # [196, D]
     sim_mat = (target_token @ patch_tokens.T).reshape(w_featmap, h_featmap).cpu().numpy()
 
     if args.threshold is not None:
@@ -226,15 +226,19 @@ if __name__ == '__main__':
     attentions = attentions.reshape(nh, w_featmap, h_featmap)
     attentions = nn.functional.interpolate(attentions.unsqueeze(0), scale_factor=args.patch_size, mode="nearest")[0].cpu().numpy()
 
-    img = torchvision.utils.make_grid(img, normalize=True, scale_each=True)
-    img = img.squeeze(0).permute(1,2,0).cpu().numpy()
+    
 
     # save attentions heatmaps
     output_dir = os.path.join(os.path.dirname(args.pretrained_weights), 'vis_att')
     os.makedirs(output_dir, exist_ok=True)
-    # torchvision.utils.save_image(torchvision.utils.make_grid(img, normalize=True, scale_each=True), os.path.join(args.output_dir, "img.png"))
-    fig, ax = plt.subplots(1, nh+2,figsize=((nh+2)*5, 5))
-    for j in range(nh+2):
+    torchvision.utils.save_image(torchvision.utils.make_grid(img, normalize=True, scale_each=True), os.path.join(output_dir, "img.png"))
+    
+    img = torchvision.utils.make_grid(img, normalize=True, scale_each=True)
+    img = img.squeeze(0).permute(1,2,0).cpu().numpy()
+    
+
+    fig, ax = plt.subplots(1, nh+1,figsize=((nh+1)*5, 5))
+    for j in range(nh+1):
         if j == 0:
             ax[j].imshow(img)
             if args.given_pos:
@@ -242,12 +246,17 @@ if __name__ == '__main__':
                 ax[j].scatter(pos[0][0][0][0], pos[0][0][0][1], marker='o', c='red')
         elif j < nh+1:
             ax[j].imshow(attentions[j-1])
+            # ax[j].imshow(th_attn[j-1])
         else:
-            ax[j].imshow(sim_mat, interpolation='nearest')
+            pass
+            # ax[j].imshow(sim_mat, interpolation='nearest')
         # plt.imsave(fname=fname, arr=attentions[j], format='png')
-    
+        # ax[j].tick_params(size=0)
+        ax[j].axes.xaxis.set_visible(False)
+        ax[j].axes.yaxis.set_visible(False)
     fname = os.path.join(output_dir, args.output_name)
-    fig.savefig(fname)
+    fig.subplots_adjust(wspace=0.1)
+    fig.savefig(fname, bbox_inches='tight', dpi=800)
     print(f"{fname} saved.")
 
 
