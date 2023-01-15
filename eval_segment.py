@@ -61,7 +61,13 @@ def eval_linear(args):
     model.cuda()
     model.eval()
     # load weights to evaluate
-    if 'leopart' in args.pretrained_weights:
+    if 'our-leopart' in args.pretrained_weights:
+        state_dict = torch.load(args.pretrained_weights)[args.checkpoint_key]
+        state_dict['patch_pos_embed'] = state_dict['pos_embed'][:, 1:, :]
+        state_dict['cls_pos_embed'] = state_dict['pos_embed'][:, :1, :]
+        msg = model.load_state_dict(state_dict, strict=False)
+        print('Pretrained weights found at {} and loaded with msg: {}'.format(args.pretrained_weights, msg))
+    elif 'leopart' in args.pretrained_weights:
         state_dict = torch.load(args.pretrained_weights)
         state_dict = {k.replace("model.", ""): v for k, v in state_dict.items()}
         state_dict['patch_pos_embed'] = state_dict['pos_embed'][:, 1:, :]
@@ -71,7 +77,7 @@ def eval_linear(args):
     else:
         utils.load_pretrained_weights(model, args.pretrained_weights, args.checkpoint_key, args.arch, args.patch_size)
     print(f"Model {args.arch} built.")
-
+    
     if args.head_type == 'linear':
         seg_head = nn.Conv2d(embed_dim, args.num_classes, 1)
         nn.init.normal_(seg_head.weight, mean=0, std=0.01)
