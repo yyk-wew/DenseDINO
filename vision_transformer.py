@@ -314,10 +314,10 @@ class VisionTransformer(nn.Module):
         return mask.detach()
       
 
-    def get_last_selfattention(self, x, pos=None, mask_mode=None):
+    def get_last_selfattention(self, x, pos=None, mask_mode=None, n=1):
         x, attn_mask = self.prepare_tokens(x, pos, mask_mode)
         for i, blk in enumerate(self.blocks):
-            if i < len(self.blocks) - 1:
+            if i < len(self.blocks) - n:
                 x = blk(x, attn_mask=attn_mask)
             else:
                 # return attention of the last block
