@@ -73,7 +73,7 @@ def get_args_parser():
     parser.add_argument('--remove_global_token', action='store_true', help='Whether to remove the global class token.')
     parser.add_argument('--num_reference', default=1, type=int, help="Number of points sampled per crop. Use k*k points in actual.")
     parser.add_argument('--sampling_mode', type=str, default='random', choices=['random', 'grid'], help='Mode of reference point sampling.')
-    parser.add_argument('--mask_mode', type=str, default='020', choices=['020', 'all2pos', 'all2pos_pos2cls', 'all2pos_pos2cls_eye'], help='Masked Attention.')
+    parser.add_argument('--mask_mode', type=str, default='020', choices=['020', 'all2pos', 'all2pos_pos2cls', 'all2pos_pos2cls_eye', "all_query"], help='Masked Attention.')
     parser.add_argument('--pretrained_weights', default="", type=str, help='Path of pretrained model weights.')
     parser.add_argument('--use_global_loss', action='store_true', help='Use original(global) dino loss.')
     parser.add_argument('--use_ref_loss', action='store_true', help='Add separate centering loss for ref token.')
@@ -84,7 +84,7 @@ def get_args_parser():
     parser.add_argument('--detach_pos_embed', action='store_true', help='Whether to detach patch_pos_embed when interpolating ref_token_pos.')
     parser.add_argument('--finetune', action='store_true', help='Train of finetune.')
     parser.add_argument('--ft_ablate', action='store_true', help='Ablation study of feature map supervision.')
-    parser.add_argument('--alpha', default=1., type=float, help='Loss weight of class token, (1-alpha) for reference token.')
+    parser.add_argument('--alpha', default=0.5, type=float, help='Loss weight of class token, (1-alpha) for reference token.')
 
     # Temperature teacher parameters
     parser.add_argument('--warmup_teacher_temp', default=0.04, type=float,

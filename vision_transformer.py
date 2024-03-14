@@ -355,6 +355,9 @@ class VisionTransformer(nn.Module):
             mask[:, num_cls_token:num_cls_token+num_ref_token] = -float('inf')
             mask[num_cls_token:num_cls_token+num_ref_token, 0] = -float('inf')
             mask = mask.fill_diagonal_(0.)
+        elif mask_mode == "all_query":
+            mask[:, : num_cls_token+num_ref_token] = -float('inf')
+            mask = mask.fill_diagonal_(0.)
         elif mask_mode is None:
             return None
         else:

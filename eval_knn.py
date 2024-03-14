@@ -108,7 +108,7 @@ def extract_feature_pipeline(args):
 
 
 @torch.no_grad()
-def extract_features(model, data_loader, use_cuda=True, multiscale=False, avgpooling=False):
+def extract_features(model, data_loader, use_cuda=True, multiscale=False, avgpooling=False, mask_mode=None):
     metric_logger = utils.MetricLogger(delimiter="  ")
     features = None
     for samples, index in metric_logger.log_every(data_loader, 10):
@@ -120,7 +120,7 @@ def extract_features(model, data_loader, use_cuda=True, multiscale=False, avgpoo
             if avgpooling:
                 feats = model.get_patch_tokens(samples).mean(dim=-2, keepdim=False).clone()
             else:
-                feats = model(samples).clone()
+                feats = model(samples, mask_mode=mask_mode).clone()
 
         # init storage feature matrix
         if dist.get_rank() == 0 and features is None:
@@ -227,11 +227,12 @@ if __name__ == '__main__':
     parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
-    parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
+    parser.add_argument("--local-rank", default=0, type=int, help="Please ignore and do not set this argument.")
     parser.add_argument('--data_path', default='/path/to/imagenet/', type=str)
     # --- new ---
     parser.add_argument('--with_learnable_token', action='store_true', help='Reference token with learnable class token.')
     parser.add_argument('--use_avgpooling', action='store_true', help='Avgpooling patch tokens as features.')
+    parser.add_argument('--mask_mode', type=str, default='020', choices=['020', 'all2pos', 'all2pos_pos2cls', 'all2pos_pos2cls_eye', "all_query"], help='Masked Attention.')
     # -----------
     args = parser.parse_args()
 
